@@ -1,0 +1,17 @@
+Estate Sale Finder
+
+{{ count }} new likely match{% if count != 1 %}es{% endif %}.
+
+{% for sale, detections in groups %}
+{{ sale.title }}
+{{ sale.url }}
+{{ sale.city or "" }}{% if sale.state %}, {{ sale.state }}{% endif %}{% if sale.postal_code %} {{ sale.postal_code }}{% endif %}{% if sale.distance_miles is not none %} - {{ "%.1f"|format(sale.distance_miles) }} mi{% endif %}
+{% if sale.organization_name %}{{ sale.organization_name }}{% endif %}
+{{ sale.picture_count }} pictures
+
+{% for detection, cid in detections %}
+- {{ detection.category }}: {{ detection.label }} (confidence {{ "%.0f"|format(detection.confidence * 100) }}%, modern {{ "%.0f"|format(detection.modern_likelihood * 100) }}%){% if detection.visible_brand %}, brand {{ detection.visible_brand }}{% endif %}
+  {% if detection.notes %}{{ detection.notes }}{% endif %}
+{% endfor %}
+
+{% endfor %}

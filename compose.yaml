@@ -1,0 +1,11 @@
+services:
+  scanner:
+    image: ghcr.io/tohutson/estate-sale-finder:latest
+    build:
+      context: .
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./model-cache:/app/model-cache
+    restart: "no"

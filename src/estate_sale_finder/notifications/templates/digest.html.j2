@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+  <body style="font-family: Arial, sans-serif; color: #17202a;">
+    <h1 style="font-size: 20px;">Estate Sale Finder</h1>
+    <p>{{ count }} new likely match{% if count != 1 %}es{% endif %}.</p>
+    {% for sale, detections in groups %}
+      <section style="border-top: 1px solid #ddd; padding: 14px 0;">
+        <h2 style="font-size: 17px; margin: 0 0 4px;">
+          <a href="{{ sale.url }}">{{ sale.title }}</a>
+        </h2>
+        <p style="margin: 0 0 10px; color: #555;">
+          {{ sale.city or "" }}{% if sale.state %}, {{ sale.state }}{% endif %}
+          {% if sale.postal_code %} {{ sale.postal_code }}{% endif %}
+          {% if sale.distance_miles is not none %} - {{ "%.1f"|format(sale.distance_miles) }} mi{% endif %}
+          {% if sale.organization_name %} - {{ sale.organization_name }}{% endif %}
+          - {{ sale.picture_count }} pictures
+        </p>
+        {% for detection, cid in detections %}
+          <div style="display: flex; gap: 12px; margin: 12px 0;">
+            {% if cid %}
+              <img src="cid:{{ cid }}" alt="" style="width: 160px; height: auto; border: 1px solid #ddd;">
+            {% endif %}
+            <div>
+              <strong>{{ detection.category }}: {{ detection.label }}</strong><br>
+              Confidence {{ "%.0f"|format(detection.confidence * 100) }}%,
+              modern likelihood {{ "%.0f"|format(detection.modern_likelihood * 100) }}%
+              {% if detection.visible_brand %}<br>Brand: {{ detection.visible_brand }}{% endif %}
+              {% if detection.notes %}<br>{{ detection.notes }}{% endif %}
+            </div>
+          </div>
+        {% endfor %}
+      </section>
+    {% endfor %}
+  </body>
+</html>
