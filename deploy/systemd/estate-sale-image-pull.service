@@ -1,0 +1,9 @@
+[Unit]
+Description=Pull Estate Sale Finder scanner image
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/estate-sale-finder
+ExecStart=/usr/bin/docker compose pull scanner
