@@ -19,6 +19,20 @@ class ImageStatus(StrEnum):
     ERROR = "error"
 
 
+class TargetCategory(StrEnum):
+    GOLF_CLUBS = "golf_clubs"
+    GOLF_BAG = "golf_bag"
+    GOLF_BALLS = "golf_balls"
+    MODERN_CAMERA = "modern_camera"
+    MODERN_CAMERA_LENS = "modern_camera_lens"
+
+
+APPROVED_TARGET_CATEGORIES = frozenset(category.value for category in TargetCategory)
+CAMERA_TARGET_CATEGORIES = frozenset(
+    {TargetCategory.MODERN_CAMERA.value, TargetCategory.MODERN_CAMERA_LENS.value}
+)
+
+
 @dataclass(frozen=True)
 class PostalCodeLocation:
     postal_code: str
@@ -93,6 +107,20 @@ class DetectedItem:
     notes: str | None = None
 
 
+def approved_detected_item(item: DetectedItem) -> DetectedItem | None:
+    if item.category not in APPROVED_TARGET_CATEGORIES:
+        return None
+    modern_likelihood = item.modern_likelihood if item.category in CAMERA_TARGET_CATEGORIES else 0.0
+    return DetectedItem(
+        category=item.category,
+        label=item.label,
+        confidence=item.confidence,
+        modern_likelihood=modern_likelihood,
+        visible_brand=item.visible_brand,
+        notes=item.notes,
+    )
+
+
 @dataclass(frozen=True)
 class ImageAnalysisResult:
     image_id: int
@@ -112,6 +140,12 @@ class RunSummary:
     changed_sales: int = 0
     images_discovered: int = 0
     images_downloaded: int = 0
+    images_prefiltered: int = 0
+    images_prefilter_passed: int = 0
+    images_prefilter_rejected: int = 0
     images_analyzed: int = 0
+    vision_batches_sent: int = 0
+    vision_batches_succeeded: int = 0
+    vision_batches_failed: int = 0
     positive_matches: int = 0
     email_status: str = "not_sent"

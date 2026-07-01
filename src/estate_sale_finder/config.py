@@ -50,8 +50,11 @@ class Settings(BaseSettings):
     vision_model: str = "gpt-4.1-mini"
     vision_api_key: str | None = None
     vision_batch_size: int = 4
-    analysis_version: str = "v1"
-    prompt_version: str = "vision-v1"
+    vision_max_images_per_run: int | None = None
+    openai_save_responses: bool = False
+    openai_response_log_dir: Path | None = None
+    analysis_version: str = "golf-camera-v2"
+    prompt_version: str = "targets-v2"
     local_prefilter_enabled: bool = False
     local_prefilter_model: str = "ViT-B-32/laion2b_s34b_b79k"
     local_prefilter_threshold: float = 0.20

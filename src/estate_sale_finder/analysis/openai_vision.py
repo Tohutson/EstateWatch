@@ -4,11 +4,13 @@ import base64
 import json
 import logging
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from estate_sale_finder.analysis.base import AnalysisImage
 from estate_sale_finder.analysis.prompts import (
@@ -17,7 +19,11 @@ from estate_sale_finder.analysis.prompts import (
     VISION_USER_PROMPT,
 )
 from estate_sale_finder.config import Settings
-from estate_sale_finder.domain.models import DetectedItem, ImageAnalysisResult
+from estate_sale_finder.domain.models import (
+    APPROVED_TARGET_CATEGORIES,
+    DetectedItem,
+    ImageAnalysisResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +36,24 @@ class ItemPayload(BaseModel):
     visible_brand: str | None
     notes: str | None
 
+    @field_validator("category")
+    @classmethod
+    def validate_category(cls, value: str) -> str:
+        if value not in APPROVED_TARGET_CATEGORIES:
+            raise ValueError(f"Unexpected detection category: {value}")
+        return value
+
 
 class ResultPayload(BaseModel):
     image_id: int
     contains_target: bool
     items: list[ItemPayload]
+
+    @model_validator(mode="after")
+    def validate_target_consistency(self) -> ResultPayload:
+        if self.contains_target != bool(self.items):
+            raise ValueError("contains_target must match whether approved items are present")
+        return self
 
 
 class ResponsePayload(BaseModel):
@@ -68,9 +87,38 @@ class OpenAIVisionProvider:
         last_error: Exception | None = None
         for attempt in range(1, self.settings.http_max_retries + 1):
             try:
+                logger.info(
+                    "openai_vision_request_sent",
+                    extra={
+                        "attempt": attempt,
+                        "model": self.model_name,
+                        "batch_size": len(images),
+                    },
+                )
                 response = self.client.post("/responses", json=payload)
+                response_payload = _response_json(response)
+                self._save_response_snapshot(
+                    images,
+                    attempt=attempt,
+                    status_code=response.status_code,
+                    request_id=response.headers.get("x-request-id"),
+                    response_payload=response_payload,
+                    response_text=response.text if response_payload is None else None,
+                )
                 response.raise_for_status()
-                parsed = _parse_response(response.json())
+                logger.info(
+                    "openai_vision_request_succeeded",
+                    extra={
+                        "attempt": attempt,
+                        "model": self.model_name,
+                        "batch_size": len(images),
+                        "status_code": response.status_code,
+                        "request_id": response.headers.get("x-request-id"),
+                    },
+                )
+                if response_payload is None:
+                    raise json.JSONDecodeError("OpenAI response was not JSON", response.text, 0)
+                parsed = _parse_response(response_payload)
                 return _to_results(
                     parsed,
                     provider=self.provider_name,
@@ -85,15 +133,97 @@ class OpenAIVisionProvider:
                 json.JSONDecodeError,
             ) as exc:
                 last_error = exc
-                logger.warning("vision_retry", extra={"attempt": attempt, "error": str(exc)})
+                self._save_error_snapshot(images, attempt=attempt, exc=exc)
+                logger.warning(
+                    "openai_vision_request_failed",
+                    extra={
+                        "attempt": attempt,
+                        "model": self.model_name,
+                        "batch_size": len(images),
+                        "error": str(exc),
+                        "status_code": _status_code(exc),
+                    },
+                )
                 if attempt < self.settings.http_max_retries:
                     time.sleep(min(8.0, 0.5 * 2 ** (attempt - 1)))
-        if len(images) > 1:
+        if len(images) > 1 and _can_retry_individually(last_error):
             results: list[ImageAnalysisResult] = []
             for image in images:
                 results.extend(self._analyze_batch([image]))
             return results
         raise RuntimeError(f"OpenAI vision analysis failed: {last_error}") from last_error
+
+    def _save_response_snapshot(
+        self,
+        images: list[AnalysisImage],
+        *,
+        attempt: int,
+        status_code: int,
+        request_id: str | None,
+        response_payload: dict[str, Any] | None,
+        response_text: str | None,
+    ) -> None:
+        if not self.settings.openai_save_responses:
+            return
+        snapshot: dict[str, Any] = {
+            "created_at": datetime.now(UTC).isoformat(),
+            "provider": self.provider_name,
+            "model": self.model_name,
+            "attempt": attempt,
+            "status_code": status_code,
+            "request_id": request_id,
+            "image_ids": [image.image_id for image in images],
+            "response": response_payload,
+            "response_text": response_text,
+        }
+        self._write_snapshot("response", snapshot)
+
+    def _save_error_snapshot(
+        self,
+        images: list[AnalysisImage],
+        *,
+        attempt: int,
+        exc: Exception,
+    ) -> None:
+        if not self.settings.openai_save_responses:
+            return
+        response_payload: dict[str, Any] | None = None
+        response_text: str | None = None
+        status_code = _status_code(exc)
+        request_id: str | None = None
+        if isinstance(exc, httpx.HTTPStatusError):
+            response_payload = _response_json(exc.response)
+            response_text = exc.response.text if response_payload is None else None
+            request_id = exc.response.headers.get("x-request-id")
+        snapshot: dict[str, Any] = {
+            "created_at": datetime.now(UTC).isoformat(),
+            "provider": self.provider_name,
+            "model": self.model_name,
+            "attempt": attempt,
+            "status_code": status_code,
+            "request_id": request_id,
+            "image_ids": [image.image_id for image in images],
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "response": response_payload,
+            "response_text": response_text,
+        }
+        self._write_snapshot("error", snapshot)
+
+    def _write_snapshot(self, kind: str, snapshot: dict[str, Any]) -> None:
+        directory = self.settings.openai_response_log_dir or (
+            self.settings.logs_dir / "openai-responses"
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        image_ids = "-".join(str(image_id) for image_id in snapshot["image_ids"])
+        filename = f"{timestamp}-{kind}-{image_ids[:80]}-{uuid4().hex[:8]}.json"
+        path = directory / filename
+        path.write_text(json.dumps(snapshot, indent=2, default=str), encoding="utf-8")
+        logger.info(
+            "openai_vision_response_saved",
+            extra={"path": str(path), "kind": kind, "image_ids": snapshot["image_ids"]},
+        )
 
     def _request_payload(self, images: list[AnalysisImage]) -> dict[str, Any]:
         content: list[dict[str, Any]] = [{"type": "input_text", "text": VISION_USER_PROMPT}]
@@ -125,6 +255,28 @@ class OpenAIVisionProvider:
 def _data_url(path: Path) -> str:
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:image/jpeg;base64,{encoded}"
+
+
+def _status_code(exc: Exception) -> int | None:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    return None
+
+
+def _response_json(response: httpx.Response) -> dict[str, Any] | None:
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return {"payload": payload}
+
+
+def _can_retry_individually(exc: Exception | None) -> bool:
+    return isinstance(exc, (ValidationError, ValueError, KeyError, json.JSONDecodeError)) and not (
+        isinstance(exc, httpx.HTTPError)
+    )
 
 
 def _parse_response(payload: dict[str, Any]) -> ResponsePayload:

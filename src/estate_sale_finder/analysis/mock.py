@@ -14,8 +14,8 @@ class MockVisionProvider:
             if "positive" in image.thumbnail_path.name or "match" in image.source_url:
                 items = [
                     DetectedItem(
-                        category="camera",
-                        label="digital camera equipment",
+                        category="modern_camera",
+                        label="modern digital camera",
                         confidence=0.9,
                         modern_likelihood=0.8,
                         visible_brand=None,
