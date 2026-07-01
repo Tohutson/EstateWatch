@@ -3,7 +3,14 @@ from __future__ import annotations
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session, selectinload
 
-from estate_sale_finder.domain.models import DetectedItem, ImageAnalysisResult, Sale, SalePicture
+from estate_sale_finder.domain.models import (
+    APPROVED_TARGET_CATEGORIES,
+    DetectedItem,
+    ImageAnalysisResult,
+    Sale,
+    SalePicture,
+    approved_detected_item,
+)
 from estate_sale_finder.utils.dates import utc_now
 from estate_sale_finder.utils.urls import normalize_url
 
@@ -27,6 +34,19 @@ class Repository:
         self.session.add(run)
         self.session.flush()
         return run
+
+    def mark_abandoned_running_runs(self) -> int:
+        now = utc_now()
+        abandoned_runs = list(
+            self.session.scalars(select(RunORM).where(RunORM.status == "running"))
+        )
+        for run in abandoned_runs:
+            run.completion_time = now
+            run.status = "failed"
+            run.error_summary = (
+                "Run was still marked running when a new run acquired the process lock"
+            )
+        return len(abandoned_runs)
 
     def finish_run(
         self,
@@ -163,6 +183,7 @@ class Repository:
                 select(DetectionORM)
                 .options(selectinload(DetectionORM.image).selectinload(ImageORM.sale))
                 .where(DetectionORM.included_in_email.is_(False))
+                .where(DetectionORM.category.in_(APPROVED_TARGET_CATEGORIES))
                 .order_by(DetectionORM.created_at.asc())
                 .limit(limit)
             )
@@ -178,10 +199,15 @@ class Repository:
         image.analyzed_at = utc_now()
         image.analysis_version = analysis_version
         image.status = "analyzed"
-        for item in result.items:
+        approved_items = [
+            approved_item
+            for item in result.items
+            if (approved_item := approved_detected_item(item)) is not None
+        ]
+        for item in approved_items:
             self.session.add(_detection_from_item(image.id, item, result, analysis_version))
         self.session.flush()
-        return len(result.items)
+        return len(approved_items)
 
     def mark_detections_emailed(self, detections: list[DetectionORM]) -> None:
         now = utc_now()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -13,7 +13,7 @@ from estate_sale_finder.analysis.local_prefilter import DisabledPrefilter
 from estate_sale_finder.config import Settings
 from estate_sale_finder.db.models import DetectionORM, ImageORM, SaleORM
 from estate_sale_finder.db.repository import Repository
-from estate_sale_finder.domain.models import RunSummary, Sale, SaleCandidate
+from estate_sale_finder.domain.models import ImageAnalysisResult, RunSummary, Sale, SaleCandidate
 from estate_sale_finder.images.downloader import ImageDownloader
 from estate_sale_finder.notifications.base import NotificationProvider
 from estate_sale_finder.sources.base import GalleryUnavailableError, SaleSource
@@ -39,6 +39,16 @@ class NoopNotifier:
         return None
 
 
+class VisionResultMappingError(RuntimeError):
+    def __init__(self, requested_ids: set[int], returned_ids: set[int]):
+        super().__init__(
+            "Vision provider response did not map cleanly to image IDs: "
+            f"requested={sorted(requested_ids)} returned={sorted(returned_ids)}"
+        )
+        self.requested_ids = requested_ids
+        self.returned_ids = returned_ids
+
+
 class Pipeline:
     def __init__(
         self,
@@ -61,6 +71,10 @@ class Pipeline:
         self.prefilter = prefilter or DisabledPrefilter()
 
     def run(self, options: RunOptions) -> RunSummary:
+        abandoned_runs = self.repo.mark_abandoned_running_runs()
+        if abandoned_runs:
+            logger.warning("abandoned_running_runs_marked_failed", extra={"count": abandoned_runs})
+        self.session.commit()
         run = self.repo.create_run()
         summary = RunSummary()
         try:
@@ -148,7 +162,12 @@ class Pipeline:
                 summary.changed_sales += 1
             if sale.picture_count >= self.settings.min_picture_count:
                 summary.sales_eligible += 1
-                if is_new or changed or sale_orm.last_gallery_refresh_at is None:
+                if (
+                    is_new
+                    or changed
+                    or sale_orm.last_gallery_refresh_at is None
+                    or sale_orm.gallery_status != "ok"
+                ):
                     to_refresh.append((sale_orm, sale_with_distance))
         self.session.commit()
         return to_refresh
@@ -192,6 +211,17 @@ class Pipeline:
             version_mismatch=options.reanalyze_version_mismatch,
             sale_db_id=sale_db_id,
         )
+        if self.settings.vision_max_images_per_run is not None:
+            original_count = len(images)
+            images = images[: self.settings.vision_max_images_per_run]
+            logger.info(
+                "vision_images_limited",
+                extra={
+                    "selected_images": len(images),
+                    "available_images": original_count,
+                    "limit": self.settings.vision_max_images_per_run,
+                },
+            )
         pending: list[AnalysisImage] = []
         for image in images:
             if not image.local_thumbnail_path:
@@ -199,9 +229,11 @@ class Pipeline:
                 image.error_message = "Missing thumbnail for analysis"
                 continue
             passed, score = self.prefilter.score(Path(image.local_thumbnail_path))
+            summary.images_prefiltered += 1
             image.local_prefilter_passed = passed
             image.local_prefilter_score = score
             if passed:
+                summary.images_prefilter_passed += 1
                 pending.append(
                     AnalysisImage(
                         image_id=image.id,
@@ -210,33 +242,119 @@ class Pipeline:
                     )
                 )
             else:
+                summary.images_prefilter_rejected += 1
                 image.analyzed_at = utc_now()
                 image.analysis_version = self.settings.analysis_version
                 image.status = "analyzed"
             self.session.commit()
 
+        logger.info(
+            "local_prefilter_complete",
+            extra={
+                "images_prefiltered": summary.images_prefiltered,
+                "images_prefilter_passed": summary.images_prefilter_passed,
+                "images_prefilter_rejected": summary.images_prefilter_rejected,
+            },
+        )
         for index in range(0, len(pending), self.settings.vision_batch_size):
             batch = pending[index : index + self.settings.vision_batch_size]
-            by_id = {
-                image.id: image
-                for image in self.session.scalars(
-                    select(ImageORM).where(ImageORM.id.in_([item.image_id for item in batch]))
+            batch_number = index // self.settings.vision_batch_size + 1
+            try:
+                by_id, results = self._analyze_vision_batch(batch, batch_number, summary)
+            except VisionResultMappingError as exc:
+                if len(batch) == 1:
+                    raise
+                logger.warning(
+                    "vision_batch_mapping_retry_individual",
+                    extra={
+                        "provider": self.vision_provider.provider_name,
+                        "model": self.vision_provider.model_name,
+                        "batch_number": batch_number,
+                        "batch_size": len(batch),
+                        "requested_ids": sorted(exc.requested_ids),
+                        "returned_ids": sorted(exc.returned_ids),
+                    },
                 )
-            }
+                for offset, item in enumerate(batch, start=1):
+                    single_by_id, single_results = self._analyze_vision_batch(
+                        [item],
+                        batch_number,
+                        summary,
+                        fallback_index=offset,
+                    )
+                    self._persist_vision_results(single_by_id, single_results, summary)
+                    self.session.commit()
+                continue
+
+            self._persist_vision_results(by_id, results, summary)
+            self.session.commit()
+
+    def _analyze_vision_batch(
+        self,
+        batch: list[AnalysisImage],
+        batch_number: int,
+        summary: RunSummary,
+        *,
+        fallback_index: int | None = None,
+    ) -> tuple[dict[int, ImageORM], list[ImageAnalysisResult]]:
+        by_id = {
+            image.id: image
+            for image in self.session.scalars(
+                select(ImageORM).where(ImageORM.id.in_([item.image_id for item in batch]))
+            )
+        }
+        requested_ids = {item.image_id for item in batch}
+        log_context = {
+            "provider": self.vision_provider.provider_name,
+            "model": self.vision_provider.model_name,
+            "batch_number": batch_number,
+            "batch_size": len(batch),
+            "fallback_index": fallback_index,
+            "requested_ids": sorted(requested_ids),
+        }
+        summary.vision_batches_sent += 1
+        logger.info("vision_batch_sent", extra=log_context)
+        try:
             results = self.vision_provider.analyze(batch)
             mapped_ids = {result.image_id for result in results}
-            if mapped_ids != set(by_id):
-                raise RuntimeError("Vision provider response did not map cleanly to image IDs")
-            for result in results:
-                image = by_id[result.image_id]
-                positives = self.repo.persist_analysis(
-                    image,
-                    result,
-                    analysis_version=self.settings.analysis_version,
-                )
-                summary.images_analyzed += 1
-                summary.positive_matches += positives
-            self.session.commit()
+            if mapped_ids != requested_ids:
+                if len(batch) == 1 and len(results) == 1:
+                    requested_id = next(iter(requested_ids))
+                    returned_id = results[0].image_id
+                    logger.warning(
+                        "vision_single_result_id_remapped",
+                        extra={**log_context, "returned_id": returned_id},
+                    )
+                    results = [replace(results[0], image_id=requested_id)]
+                    mapped_ids = requested_ids
+                else:
+                    raise VisionResultMappingError(requested_ids, mapped_ids)
+        except Exception:
+            summary.vision_batches_failed += 1
+            logger.exception("vision_batch_failed", extra=log_context)
+            raise
+
+        summary.vision_batches_succeeded += 1
+        logger.info(
+            "vision_batch_succeeded", extra={**log_context, "returned_ids": sorted(mapped_ids)}
+        )
+        return by_id, results
+
+    def _persist_vision_results(
+        self,
+        by_id: dict[int, ImageORM],
+        results: list[ImageAnalysisResult],
+        summary: RunSummary,
+    ) -> None:
+        for result in results:
+            image = by_id[result.image_id]
+            positives = self.repo.persist_analysis(
+                image,
+                result,
+                analysis_version=self.settings.analysis_version,
+            )
+            summary.images_analyzed += 1
+            summary.positive_matches += positives
 
     def _send_digest(self, summary: RunSummary, options: RunOptions) -> None:
         detections = self.repo.unemailable_detections(limit=50)
