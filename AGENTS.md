@@ -5,6 +5,7 @@
 - Preserve idempotency: reruns must not duplicate image analysis or email notifications.
 - Keep EstateSales.NET behavior isolated in `src/estate_sale_finder/sources/estatesales_net.py`.
 - Add fixture-based parser tests whenever sale-page or API parsing changes.
+- Current targets are only golf clubs, golf bags, golf balls, modern digital cameras, and modern camera lenses.
 - Never commit secrets, `.env`, database files, thumbnails, model caches, or live credentials.
 - Run formatting, Ruff, mypy, tests, CLI help, and migrations before handing work back.
 - Update Alembic migrations when the schema changes.
