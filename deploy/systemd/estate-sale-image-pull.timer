@@ -4,6 +4,7 @@ Description=Pull Estate Sale Finder scanner image hourly
 [Timer]
 OnCalendar=hourly
 Persistent=true
+RandomizedDelaySec=10m
 
 [Install]
 WantedBy=timers.target

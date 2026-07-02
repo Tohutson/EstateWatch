@@ -6,4 +6,5 @@ After=docker.service network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/estate-sale-finder
+ExecStartPre=/usr/bin/docker compose run --rm scanner migrate
 ExecStart=/usr/bin/docker compose run --rm scanner run

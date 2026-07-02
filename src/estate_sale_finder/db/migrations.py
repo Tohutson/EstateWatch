@@ -11,6 +11,7 @@ def alembic_config(database_url: str) -> Config:
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     config.set_main_option("sqlalchemy.url", database_url)
+    config.attributes["configure_logger"] = False
     return config
 
 

@@ -9,8 +9,9 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from estate_sale_finder.analysis.base import AnalysisImage
+from estate_sale_finder.analysis.errors import VisionProviderError
 from estate_sale_finder.config import Settings
-from estate_sale_finder.db.models import Base, DetectionORM, ImageORM
+from estate_sale_finder.db.models import Base, DetectionORM, ImageORM, RunORM
 from estate_sale_finder.domain.models import (
     DetectedItem,
     ImageAnalysisResult,
@@ -28,6 +29,7 @@ class FakeSource:
     def __init__(self, picture_count: int = 5, picture_urls: list[str] | None = None):
         self.picture_count = picture_count
         self.picture_urls = picture_urls or ["https://example.test/match-1.jpg"]
+        self.remote_modified_at = datetime(2026, 6, 20, tzinfo=UTC)
         self.gallery_calls = 0
 
     def resolve_postal_code(self, postal_code: str) -> PostalCodeLocation:
@@ -68,7 +70,7 @@ class FakeSource:
                 first_start_at=datetime(2026, 7, 1, tzinfo=UTC),
                 last_end_at=datetime(2026, 7, 2, tzinfo=UTC),
                 first_published_at=None,
-                remote_modified_at=datetime(2026, 6, 20, tzinfo=UTC),
+                remote_modified_at=self.remote_modified_at,
                 latest_pictures_added_count=len(self.picture_urls),
             )
         ]
@@ -105,15 +107,145 @@ class FakeVision:
         self.calls += len(images)
         return [
             ImageAnalysisResult(
-                image_id=image.image_id,
+                image_ref=image.image_ref,
                 contains_target=True,
-                items=[DetectedItem("camera", "digital camera", 0.9, 0.8, None, "match")],
+                items=[DetectedItem("modern_camera", "digital camera", 0.9, 0.8, None, "match")],
                 provider="fake",
                 model_name="fake-model",
                 prompt_version="test",
             )
             for image in images
         ]
+
+
+class BadBatchVision:
+    provider_name = "fake"
+    model_name = "fake-model"
+
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
+    def analyze(self, images: list[AnalysisImage]) -> list[ImageAnalysisResult]:
+        self.batch_sizes.append(len(images))
+        if len(images) > 1:
+            return [
+                ImageAnalysisResult(
+                    image_ref="img_unknown",
+                    contains_target=False,
+                    items=[],
+                    provider="fake",
+                    model_name="fake-model",
+                    prompt_version="test",
+                )
+            ]
+        return [
+            ImageAnalysisResult(
+                image_ref=images[0].image_ref,
+                contains_target=False,
+                items=[],
+                provider="fake",
+                model_name="fake-model",
+                prompt_version="test",
+            )
+        ]
+
+
+class BadSingleVision:
+    provider_name = "fake"
+    model_name = "fake-model"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def analyze(self, images: list[AnalysisImage]) -> list[ImageAnalysisResult]:
+        self.calls += len(images)
+        return [
+            ImageAnalysisResult(
+                image_ref="wrong_ref",
+                contains_target=False,
+                items=[],
+                provider="fake",
+                model_name="fake-model",
+                prompt_version="test",
+            )
+        ]
+
+
+class AlwaysFailVision:
+    provider_name = "fake"
+    model_name = "fake-model"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def analyze(self, images: list[AnalysisImage]) -> list[ImageAnalysisResult]:
+        self.calls += 1
+        raise VisionProviderError("provider parse failure with redacted payload")
+
+
+class MalformedThenMixedIndividualVision:
+    provider_name = "fake"
+    model_name = "fake-model"
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.single_attempts: dict[int, int] = {}
+
+    def analyze(self, images: list[AnalysisImage]) -> list[ImageAnalysisResult]:
+        self.calls.append([image.image_ref for image in images])
+        if len(images) > 1:
+            return [
+                ImageAnalysisResult(
+                    image_ref="img_0001",
+                    contains_target=True,
+                    items=[
+                        DetectedItem("modern_camera", "digital camera", 0.9, 0.8, None, "match")
+                    ],
+                    provider="fake",
+                    model_name="fake-model",
+                    prompt_version="test",
+                ),
+                ImageAnalysisResult(
+                    image_ref="img_0001",
+                    contains_target=False,
+                    items=[],
+                    provider="fake",
+                    model_name="fake-model",
+                    prompt_version="test",
+                ),
+                ImageAnalysisResult(
+                    image_ref="img_unknown",
+                    contains_target=False,
+                    items=[],
+                    provider="fake",
+                    model_name="fake-model",
+                    prompt_version="test",
+                ),
+            ]
+        image_id = images[0].image_id
+        self.single_attempts[image_id] = self.single_attempts.get(image_id, 0) + 1
+        if image_id == 2:
+            raise VisionProviderError("single image provider failure")
+        return [
+            ImageAnalysisResult(
+                image_ref=images[0].image_ref,
+                contains_target=True,
+                items=[DetectedItem("modern_camera", "digital camera", 0.9, 0.8, None, "match")],
+                provider="fake",
+                model_name="fake-model",
+                prompt_version="test",
+            )
+        ]
+
+
+class FakePrefilter:
+    def __init__(self, passed: bool) -> None:
+        self.passed = passed
+        self.calls = 0
+
+    def score(self, image_path: Path) -> tuple[bool, float]:
+        self.calls += 1
+        return self.passed, 0.9 if self.passed else 0.1
 
 
 class FakeNotifier:
@@ -200,10 +332,61 @@ def test_below_minimum_later_becomes_eligible(tmp_path: Path) -> None:
     )
     first = pipeline.run(RunOptions())
     source.picture_count = 5
+    source.picture_urls = [f"https://example.test/match-{index}.jpg" for index in range(200)]
+    source.remote_modified_at = datetime(2026, 6, 22, tzinfo=UTC)
     second = pipeline.run(RunOptions())
     assert first.sales_eligible == 0
     assert second.sales_eligible == 1
+    assert len(list(session.scalars(select(ImageORM)))) == 200
+    assert second.images_analyzed == 200
+
+
+def test_changed_modified_date_with_same_images_is_idempotent(tmp_path: Path) -> None:
+    session = _session()
+    source = FakeSource(picture_urls=["https://example.test/match-1.jpg"])
+    vision = FakeVision()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=vision,
+    )
+    pipeline.run(RunOptions())
+    source.remote_modified_at = datetime(2026, 6, 23, tzinfo=UTC)
+    second = pipeline.run(RunOptions())
+    assert source.gallery_calls == 2
+    assert second.images_analyzed == 0
+    assert vision.calls == 1
+
+
+def test_failed_gallery_scan_is_retried(tmp_path: Path) -> None:
+    class FailingOnceSource(FakeSource):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        def get_sale_pictures(self, sale: Sale) -> list[SalePicture]:
+            self.gallery_calls += 1
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("temporary gallery failure")
+            return [SalePicture(str(index), url) for index, url in enumerate(self.picture_urls)]
+
+    session = _session()
+    source = FailingOnceSource()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=FakeVision(),
+    )
+    first = pipeline.run(RunOptions())
+    second = pipeline.run(RunOptions())
+    assert first.images_analyzed == 0
     assert second.images_analyzed == 1
+    assert source.gallery_calls == 2
 
 
 def test_failed_email_does_not_mark_sent(tmp_path: Path) -> None:
@@ -238,3 +421,223 @@ def test_analysis_version_change_reanalyzes_when_requested(tmp_path: Path) -> No
     pipeline.settings.analysis_version = "v2"
     second = pipeline.run(RunOptions(reanalyze_version_mismatch=True))
     assert second.images_analyzed == 1
+
+
+def test_local_prefilter_counts_passed_and_rejected_images(tmp_path: Path) -> None:
+    session = _session()
+    source = FakeSource(picture_urls=["https://example.test/rejected.jpg"])
+    vision = FakeVision()
+    prefilter = FakePrefilter(passed=False)
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=vision,
+        prefilter=prefilter,
+    )
+    summary = pipeline.run(RunOptions())
+    image = session.scalar(select(ImageORM))
+
+    assert prefilter.calls == 1
+    assert summary.images_prefiltered == 1
+    assert summary.images_prefilter_passed == 0
+    assert summary.images_prefilter_rejected == 1
+    assert summary.vision_batches_sent == 0
+    assert summary.vision_batches_succeeded == 0
+    assert summary.images_analyzed == 0
+    assert vision.calls == 0
+    assert image is not None
+    assert image.local_prefilter_passed is False
+
+
+def test_vision_batch_counts_when_prefilter_passes(tmp_path: Path) -> None:
+    session = _session()
+    source = FakeSource(picture_urls=["https://example.test/match-1.jpg"])
+    vision = FakeVision()
+    prefilter = FakePrefilter(passed=True)
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=vision,
+        prefilter=prefilter,
+    )
+    summary = pipeline.run(RunOptions())
+
+    assert summary.images_prefiltered == 1
+    assert summary.images_prefilter_passed == 1
+    assert summary.images_prefilter_rejected == 0
+    assert summary.vision_batches_sent == 1
+    assert summary.vision_batches_succeeded == 1
+    assert summary.vision_batches_failed == 0
+    assert summary.images_analyzed == 1
+    assert vision.calls == 1
+
+
+def test_bad_batch_mapping_retries_images_individually(tmp_path: Path) -> None:
+    session = _session()
+    source = FakeSource(
+        picture_urls=[
+            "https://example.test/image-1.jpg",
+            "https://example.test/image-2.jpg",
+        ]
+    )
+    vision = BadBatchVision()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=vision,
+    )
+    pipeline.settings.vision_batch_size = 2
+    summary = pipeline.run(RunOptions())
+
+    assert vision.batch_sizes == [2, 2, 1, 1]
+    assert summary.vision_batches_sent == 4
+    assert summary.vision_batches_failed == 2
+    assert summary.vision_batches_succeeded == 2
+    assert summary.images_analyzed == 2
+    assert summary.vision_batches_retried == 2
+
+
+def test_single_image_bad_ref_is_corrected(tmp_path: Path) -> None:
+    session = _session()
+    vision = BadSingleVision()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=FakeSource(),
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=vision,
+    )
+    summary = pipeline.run(RunOptions())
+    image = session.scalar(select(ImageORM))
+
+    assert vision.calls == 1
+    assert summary.vision_batches_failed == 0
+    assert summary.images_analyzed == 1
+    assert image is not None
+    assert image.status == "analyzed"
+
+
+def test_malformed_batch_retries_individually_and_marks_only_failed_image(
+    tmp_path: Path,
+) -> None:
+    session = _session()
+    source = FakeSource(
+        picture_urls=[
+            "https://example.test/image-1.jpg",
+            "https://example.test/image-2.jpg",
+            "https://example.test/image-3.jpg",
+        ]
+    )
+    vision = MalformedThenMixedIndividualVision()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=vision,
+    )
+    pipeline.settings.vision_batch_size = 3
+    pipeline.settings.vision_max_batch_attempts = 1
+    pipeline.settings.vision_max_single_image_attempts = 2
+    summary = pipeline.run(RunOptions())
+    images = list(session.scalars(select(ImageORM).order_by(ImageORM.id)))
+    detections = list(session.scalars(select(DetectionORM).order_by(DetectionORM.image_id)))
+
+    assert vision.calls == [
+        ["img_0001", "img_0002", "img_0003"],
+        ["img_0001"],
+        ["img_0001"],
+        ["img_0001"],
+        ["img_0001"],
+    ]
+    assert summary.vision_batch_mapping_failures == 1
+    assert summary.images_retried_individually == 3
+    assert summary.images_analysis_failed == 1
+    assert summary.images_analysis_succeeded == 2
+    assert summary.images_analyzed == 2
+    assert [image.status for image in images] == ["analyzed", "failed", "analyzed"]
+    assert images[1].analyzed_at is None
+    assert images[1].last_analysis_error is not None
+    assert len(detections) == 2
+    assert [detection.image_id for detection in detections] == [images[0].id, images[2].id]
+
+
+def test_failed_image_is_retryable_without_duplicate_prior_successes(tmp_path: Path) -> None:
+    session = _session()
+    source = FakeSource(picture_urls=["https://example.test/image-1.jpg"])
+    failing = AlwaysFailVision()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=failing,
+    )
+    pipeline.settings.vision_max_batch_attempts = 1
+    first = pipeline.run(RunOptions())
+    image = session.scalar(select(ImageORM))
+
+    assert first.images_analysis_failed == 1
+    assert image is not None
+    assert image.status == "failed"
+    assert image.analyzed_at is None
+
+    pipeline.vision_provider = FakeVision()
+    second = pipeline.run(RunOptions())
+
+    assert second.images_analyzed == 1
+    assert image.status == "analyzed"
+    assert image.analysis_attempt_count == 2
+    assert len(list(session.scalars(select(DetectionORM)))) == 1
+
+
+def test_vision_max_images_per_run_limits_analysis(tmp_path: Path) -> None:
+    session = _session()
+    vision = FakeVision()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=FakeSource(
+            picture_urls=[
+                "https://example.test/image-1.jpg",
+                "https://example.test/image-2.jpg",
+                "https://example.test/image-3.jpg",
+            ]
+        ),
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=vision,
+    )
+    pipeline.settings.vision_max_images_per_run = 2
+    first = pipeline.run(RunOptions())
+    second = pipeline.run(RunOptions())
+
+    assert first.images_analyzed == 2
+    assert second.images_analyzed == 1
+    assert vision.calls == 3
+
+
+def test_stale_running_runs_are_marked_failed(tmp_path: Path) -> None:
+    session = _session()
+    stale = RunORM(start_time=datetime(2026, 6, 30, tzinfo=UTC), status="running")
+    session.add(stale)
+    session.commit()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=FakeSource(),
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=FakeVision(),
+    )
+
+    pipeline.run(RunOptions())
+    session.refresh(stale)
+
+    assert stale.status == "failed"
+    assert stale.completion_time is not None
+    assert stale.error_summary is not None

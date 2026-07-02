@@ -1,9 +1,16 @@
 from __future__ import annotations
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, delete, select
 from sqlalchemy.orm import Session, selectinload
 
-from estate_sale_finder.domain.models import DetectedItem, ImageAnalysisResult, Sale, SalePicture
+from estate_sale_finder.domain.models import (
+    APPROVED_TARGET_CATEGORIES,
+    DetectedItem,
+    ImageAnalysisResult,
+    Sale,
+    SalePicture,
+    approved_detected_item,
+)
 from estate_sale_finder.utils.dates import utc_now
 from estate_sale_finder.utils.urls import normalize_url
 
@@ -28,6 +35,19 @@ class Repository:
         self.session.flush()
         return run
 
+    def mark_abandoned_running_runs(self) -> int:
+        now = utc_now()
+        abandoned_runs = list(
+            self.session.scalars(select(RunORM).where(RunORM.status == "running"))
+        )
+        for run in abandoned_runs:
+            run.completion_time = now
+            run.status = "failed"
+            run.error_summary = (
+                "Run was still marked running when a new run acquired the process lock"
+            )
+        return len(abandoned_runs)
+
     def finish_run(
         self,
         run: RunORM,
@@ -47,6 +67,12 @@ class Repository:
             "images_discovered",
             "images_downloaded",
             "images_analyzed",
+            "vision_batches_attempted",
+            "vision_batches_retried",
+            "vision_batch_mapping_failures",
+            "images_retried_individually",
+            "images_analysis_failed",
+            "images_analysis_succeeded",
             "positive_matches",
             "email_status",
         ]:
@@ -141,10 +167,10 @@ class Repository:
     ) -> list[ImageORM]:
         if reanalyze or version_mismatch:
             stmt: Select[tuple[ImageORM]] = select(ImageORM).where(
-                ImageORM.status.in_(["downloaded", "analyzed"])
+                ImageORM.status.in_(["downloaded", "analyzed", "failed"])
             )
         else:
-            stmt = select(ImageORM).where(ImageORM.status == "downloaded")
+            stmt = select(ImageORM).where(ImageORM.status.in_(["downloaded", "failed"]))
         if sale_db_id is not None:
             stmt = stmt.where(ImageORM.sale_id == sale_db_id)
         if not reanalyze:
@@ -163,6 +189,7 @@ class Repository:
                 select(DetectionORM)
                 .options(selectinload(DetectionORM.image).selectinload(ImageORM.sale))
                 .where(DetectionORM.included_in_email.is_(False))
+                .where(DetectionORM.category.in_(APPROVED_TARGET_CATEGORIES))
                 .order_by(DetectionORM.created_at.asc())
                 .limit(limit)
             )
@@ -178,10 +205,30 @@ class Repository:
         image.analyzed_at = utc_now()
         image.analysis_version = analysis_version
         image.status = "analyzed"
-        for item in result.items:
+        image.last_analysis_error = None
+        approved_items = [
+            approved_item
+            for item in result.items
+            if (approved_item := approved_detected_item(item)) is not None
+        ]
+        self.session.execute(delete(DetectionORM).where(DetectionORM.image_id == image.id))
+        for item in approved_items:
             self.session.add(_detection_from_item(image.id, item, result, analysis_version))
         self.session.flush()
-        return len(result.items)
+        return len(approved_items)
+
+    def mark_analysis_attempt(self, image: ImageORM) -> None:
+        image.analysis_attempt_count += 1
+        image.last_analysis_attempt_at = utc_now()
+        if image.analyzed_at is None:
+            image.status = "analyzing"
+
+    def mark_analysis_failed(self, image: ImageORM, error: str) -> None:
+        image.last_analysis_error = _bounded_error(error)
+        image.error_message = image.last_analysis_error
+        if image.analyzed_at is None:
+            image.status = "failed"
+        self.session.flush()
 
     def mark_detections_emailed(self, detections: list[DetectionORM]) -> None:
         now = utc_now()
@@ -210,3 +257,10 @@ def _detection_from_item(
         analysis_version=analysis_version,
         created_at=utc_now(),
     )
+
+
+def _bounded_error(error: str, limit: int = 500) -> str:
+    sanitized = " ".join(error.split())
+    if len(sanitized) <= limit:
+        return sanitized
+    return sanitized[: limit - 3] + "..."

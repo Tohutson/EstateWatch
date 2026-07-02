@@ -6,28 +6,39 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 POSITIVE_CONCEPTS = [
-    "modern mirrorless camera",
+    "modern mirrorless digital camera",
     "modern DSLR camera",
-    "interchangeable-lens digital camera",
-    "camera lens",
-    "camera bag containing photography equipment",
+    "modern compact digital camera",
+    "modern interchangeable camera lens",
+    "mirrorless camera lens",
+    "DSLR camera lens",
     "golf clubs",
-    "golf bag",
+    "set of golf irons",
     "golf driver",
-    "golf irons",
-    "golf wedges",
-    "golf rangefinder",
-    "modern golf equipment",
+    "golf putter",
+    "golf bag",
+    "golf balls",
 ]
 
 NEGATIVE_CONCEPTS = [
     "antique film camera",
+    "vintage camera",
     "security camera",
-    "toy camera",
-    "camera shown in a painting",
+    "webcam",
+    "camcorder",
+    "tripod",
+    "camera bag without a camera",
+    "camera accessories",
+    "camera shown in a picture",
+    "golf clothing",
+    "golf shoes",
+    "golf cart",
+    "golf rangefinder",
     "miniature golf",
     "golf shown on a television",
-    "decorative golf object",
+    "decorative golf item",
+    "empty product packaging",
+    "ordinary household objects",
 ]
 
 

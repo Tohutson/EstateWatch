@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from estate_sale_finder.db.models import Base
+from estate_sale_finder.db.models import Base, DetectionORM
 from estate_sale_finder.db.repository import Repository, sale_has_changed
 from estate_sale_finder.domain.models import DetectedItem, ImageAnalysisResult, Sale, SalePicture
 
@@ -71,9 +71,11 @@ def test_detection_persistence_and_email_status() -> None:
     repo.persist_analysis(
         image,
         ImageAnalysisResult(
-            image_id=image.id,
+            image_ref="img_0001",
             contains_target=True,
-            items=[DetectedItem("camera", "mirrorless camera", 0.9, 0.8, "Sony", "visible body")],
+            items=[
+                DetectedItem("modern_camera", "mirrorless camera", 0.9, 0.8, "Sony", "visible body")
+            ],
             provider="mock",
             model_name="mock",
             prompt_version="mock",
@@ -83,6 +85,59 @@ def test_detection_persistence_and_email_status() -> None:
     detections = repo.unemailable_detections(limit=10)
     assert len(detections) == 1
     repo.mark_detections_emailed(detections)
+    assert repo.unemailable_detections(limit=10) == []
+
+
+def test_unknown_detection_categories_are_not_persisted() -> None:
+    session = _session()
+    repo = Repository(session)
+    sale_orm, _, _ = repo.upsert_sale(_sale())
+    image, _ = repo.upsert_image(sale_orm, SalePicture(None, "https://example.test/a.jpg"))
+    image.status = "downloaded"
+    positives = repo.persist_analysis(
+        image,
+        ImageAnalysisResult(
+            image_ref="img_0001",
+            contains_target=True,
+            items=[
+                DetectedItem(
+                    "unexpected_category", "non-target item", 0.9, 0.0, None, "not target"
+                ),
+                DetectedItem("legacy_category", "non-target item", 0.8, 0.0, None, "not target"),
+            ],
+            provider="mock",
+            model_name="mock",
+            prompt_version="mock",
+        ),
+        analysis_version="v1",
+    )
+    assert positives == 0
+    assert repo.unemailable_detections(limit=10) == []
+
+
+def test_unapproved_existing_detections_are_not_emailed() -> None:
+    session = _session()
+    repo = Repository(session)
+    sale_orm, _, _ = repo.upsert_sale(_sale())
+    image, _ = repo.upsert_image(sale_orm, SalePicture(None, "https://example.test/a.jpg"))
+    detection = DetectionORM(
+        image_id=image.id,
+        category="legacy_category",
+        label="not approved",
+        confidence=0.9,
+        modern_likelihood=0.0,
+        visible_brand=None,
+        notes=None,
+        model_provider="mock",
+        model_name="mock",
+        prompt_version="old",
+        analysis_version="old",
+        created_at=datetime(2026, 7, 1, tzinfo=UTC),
+        included_in_email=False,
+    )
+    session.add(detection)
+    session.commit()
+
     assert repo.unemailable_detections(limit=10) == []
 
 

@@ -1,18 +1,33 @@
-PROMPT_VERSION = "vision-v1"
+PROMPT_VERSION = "targets-v2"
 
 VISION_SYSTEM_PROMPT = (
-    "You classify estate sale photos for useful modern camera equipment and golf equipment. "
-    "Identify only actual visible physical items. Distinguish modern digital cameras from "
-    "antique film cameras, security cameras, toys, paintings, books, televisions, packaging, "
-    "and decorative objects. Distinguish real golf equipment from miniature golf, televised "
-    "golf, artwork, or decor. Estimate modern likelihood only when visible evidence supports "
-    "it. Identify visible brands only when legible. Do not invent model numbers."
+    "Classify each estate sale image independently. Report only actual visible physical "
+    "objects in these approved categories: golf_clubs, golf_bag, golf_balls, modern_camera, "
+    "modern_camera_lens. Golf clubs include drivers, woods, hybrids, irons, wedges, and "
+    "putters; golf bags qualify whether empty or holding clubs; golf balls qualify only when "
+    "real balls are clearly visible. Modern cameras include useful digital mirrorless, DSLR, "
+    "and compact digital camera bodies. Modern camera lenses include interchangeable DSLR or "
+    "mirrorless lenses. Do not report antique or vintage film cameras, disposable cameras, "
+    "security cameras, webcams, action cameras, camcorders, bags by themselves, tripods, "
+    "flashes, batteries, chargers, straps, filters, memory cards, books, artwork, screens, "
+    "advertisements, packaging, decorative objects, golf rangefinders, golf clothing, golf "
+    "shoes, hats, gloves, tees, towels, training aids, carts, scorecards, headcovers, "
+    "miniature golf objects, televisions showing golf, or unrelated household objects. Be "
+    "conservative: do not guess when image quality is poor, do not invent a brand, model, "
+    "age, or type, and use visible_brand only when a logo or marking is legible. Return "
+    "confidence from visual evidence. Return modern_likelihood only for modern_camera and "
+    "modern_camera_lens; use 0 for golf items. Preserve the supplied image_ref exactly. "
+    "Never invent, transform, merge, omit, or duplicate image_ref values. Return an explicit "
+    "non-match for every image without an approved target, including blurry, irrelevant, or "
+    "unreadable images."
 )
 
 VISION_USER_PROMPT = (
-    "Return one result per supplied image id. Target categories are camera, camera_lens, "
-    "camera_accessory, golf_clubs, golf_bag, golf_rangefinder, golf_accessory, and other. "
-    "Include items only when they are likely useful matches for shopping."
+    "Return strict JSON with exactly one result for every supplied image. Preserve image_ref "
+    "exactly as provided, never invent or transform it, never merge multiple images into one "
+    "result, and never return duplicate references. If an image has no approved target or "
+    "cannot be interpreted, return contains_target=false and items=[]. Include only approved "
+    "categories."
 )
 
 VISION_RESPONSE_SCHEMA = {
@@ -25,7 +40,7 @@ VISION_RESPONSE_SCHEMA = {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "image_id": {"type": "integer"},
+                    "image_ref": {"type": "string"},
                     "contains_target": {"type": "boolean"},
                     "items": {
                         "type": "array",
@@ -36,14 +51,11 @@ VISION_RESPONSE_SCHEMA = {
                                 "category": {
                                     "type": "string",
                                     "enum": [
-                                        "camera",
-                                        "camera_lens",
-                                        "camera_accessory",
                                         "golf_clubs",
                                         "golf_bag",
-                                        "golf_rangefinder",
-                                        "golf_accessory",
-                                        "other",
+                                        "golf_balls",
+                                        "modern_camera",
+                                        "modern_camera_lens",
                                     ],
                                 },
                                 "label": {"type": "string"},
@@ -63,7 +75,7 @@ VISION_RESPONSE_SCHEMA = {
                         },
                     },
                 },
-                "required": ["image_id", "contains_target", "items"],
+                "required": ["image_ref", "contains_target", "items"],
             },
         }
     },

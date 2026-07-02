@@ -13,6 +13,7 @@ from jinja2 import Environment, PackageLoader, select_autoescape
 
 from estate_sale_finder.config import Settings
 from estate_sale_finder.db.models import DetectionORM, SaleORM
+from estate_sale_finder.domain.models import CAMERA_TARGET_CATEGORIES
 
 
 @dataclass(frozen=True)
@@ -76,10 +77,16 @@ def render_digest(env: Environment, detections: list[DetectionORM]) -> RenderedD
         sale = detection.image.sale
         cid: str | None = None
         if detection.image.local_thumbnail_path:
-            cid = make_msgid(domain="estate-sale-finder.local")[1:-1]
-            cid_paths[cid] = Path(detection.image.local_thumbnail_path)
+            path = Path(detection.image.local_thumbnail_path)
+            if path.is_file():
+                cid = make_msgid(domain="estate-sale-finder.local")[1:-1]
+                cid_paths[cid] = path
         grouped[sale].append((detection, cid))
-    context = {"groups": list(grouped.items()), "count": len(detections)}
+    context = {
+        "camera_categories": CAMERA_TARGET_CATEGORIES,
+        "groups": list(grouped.items()),
+        "count": len(detections),
+    }
     subject = (
         f"Estate Sale Finder: {len(detections)} new match{'es' if len(detections) != 1 else ''}"
     )

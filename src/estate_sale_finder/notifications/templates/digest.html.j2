@@ -13,6 +13,7 @@
           {% if sale.postal_code %} {{ sale.postal_code }}{% endif %}
           {% if sale.distance_miles is not none %} - {{ "%.1f"|format(sale.distance_miles) }} mi{% endif %}
           {% if sale.organization_name %} - {{ sale.organization_name }}{% endif %}
+          - {{ sale.first_start_at.strftime("%Y-%m-%d") }} to {{ sale.last_end_at.strftime("%Y-%m-%d") }}
           - {{ sale.picture_count }} pictures
         </p>
         {% for detection, cid in detections %}
@@ -22,8 +23,8 @@
             {% endif %}
             <div>
               <strong>{{ detection.category }}: {{ detection.label }}</strong><br>
-              Confidence {{ "%.0f"|format(detection.confidence * 100) }}%,
-              modern likelihood {{ "%.0f"|format(detection.modern_likelihood * 100) }}%
+              Confidence {{ "%.0f"|format(detection.confidence * 100) }}%
+              {% if detection.category in camera_categories %}<br>Modern likelihood {{ "%.0f"|format(detection.modern_likelihood * 100) }}%{% endif %}
               {% if detection.visible_brand %}<br>Brand: {{ detection.visible_brand }}{% endif %}
               {% if detection.notes %}<br>{{ detection.notes }}{% endif %}
             </div>

@@ -32,11 +32,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev
 
-      - name: Ruff
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: Ruff lint
         run: uv run ruff check .
 
       - name: Mypy
-        run: uv run mypy
+        run: uv run mypy src
 
       - name: Tests
         run: uv run pytest
