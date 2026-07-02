@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -9,7 +11,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from estate_sale_finder.analysis.base import AnalysisImage, LocalPrefilter, VisionProvider
+from estate_sale_finder.analysis.errors import (
+    VisionProviderError,
+    VisionResponseMappingError,
+)
 from estate_sale_finder.analysis.local_prefilter import DisabledPrefilter
+from estate_sale_finder.analysis.mapping import validate_vision_result_mapping
 from estate_sale_finder.config import Settings
 from estate_sale_finder.db.models import DetectionORM, ImageORM, SaleORM
 from estate_sale_finder.db.repository import Repository
@@ -37,16 +44,6 @@ class NoopNotifier:
 
     def send_failure(self, subject: str, body: str) -> None:
         return None
-
-
-class VisionResultMappingError(RuntimeError):
-    def __init__(self, requested_ids: set[int], returned_ids: set[int]):
-        super().__init__(
-            "Vision provider response did not map cleanly to image IDs: "
-            f"requested={sorted(requested_ids)} returned={sorted(returned_ids)}"
-        )
-        self.requested_ids = requested_ids
-        self.returned_ids = returned_ids
 
 
 class Pipeline:
@@ -259,34 +256,53 @@ class Pipeline:
         for index in range(0, len(pending), self.settings.vision_batch_size):
             batch = pending[index : index + self.settings.vision_batch_size]
             batch_number = index // self.settings.vision_batch_size + 1
-            try:
-                by_id, results = self._analyze_vision_batch(batch, batch_number, summary)
-            except VisionResultMappingError as exc:
-                if len(batch) == 1:
-                    raise
-                logger.warning(
-                    "vision_batch_mapping_retry_individual",
-                    extra={
-                        "provider": self.vision_provider.provider_name,
-                        "model": self.vision_provider.model_name,
-                        "batch_number": batch_number,
-                        "batch_size": len(batch),
-                        "requested_ids": sorted(exc.requested_ids),
-                        "returned_ids": sorted(exc.returned_ids),
-                    },
-                )
-                for offset, item in enumerate(batch, start=1):
-                    single_by_id, single_results = self._analyze_vision_batch(
-                        [item],
-                        batch_number,
-                        summary,
-                        fallback_index=offset,
-                    )
-                    self._persist_vision_results(single_by_id, single_results, summary)
-                    self.session.commit()
-                continue
+            self._analyze_vision_batch_with_fallback(batch, batch_number, summary)
 
-            self._persist_vision_results(by_id, results, summary)
+    def _analyze_vision_batch_with_fallback(
+        self,
+        batch: list[AnalysisImage],
+        batch_number: int,
+        summary: RunSummary,
+    ) -> None:
+        try:
+            mapped_results = self._analyze_vision_batch(
+                batch,
+                batch_number,
+                summary,
+                max_attempts=self.settings.vision_max_batch_attempts,
+            )
+            self._persist_vision_results(mapped_results, summary)
+            self.session.commit()
+            return
+        except VisionProviderError as exc:
+            if len(batch) == 1:
+                self._mark_image_analysis_failed(batch[0], exc, summary)
+                self.session.commit()
+                return
+            summary.vision_batches_retried += 1
+            logger.warning(
+                "vision_batch_retry_individual",
+                extra={
+                    **self._vision_log_context(batch, batch_number),
+                    "retry_strategy": "individual",
+                    "error_type": type(exc).__name__,
+                    "error": _sanitize_error(str(exc)),
+                },
+            )
+
+        for offset, item in enumerate(batch, start=1):
+            summary.images_retried_individually += 1
+            try:
+                mapped_results = self._analyze_vision_batch(
+                    [item],
+                    batch_number,
+                    summary,
+                    fallback_index=offset,
+                    max_attempts=self.settings.vision_max_single_image_attempts,
+                )
+                self._persist_vision_results(mapped_results, summary)
+            except VisionProviderError as exc:
+                self._mark_image_analysis_failed(item, exc, summary)
             self.session.commit()
 
     def _analyze_vision_batch(
@@ -296,65 +312,143 @@ class Pipeline:
         summary: RunSummary,
         *,
         fallback_index: int | None = None,
-    ) -> tuple[dict[int, ImageORM], list[ImageAnalysisResult]]:
-        by_id = {
-            image.id: image
-            for image in self.session.scalars(
-                select(ImageORM).where(ImageORM.id.in_([item.image_id for item in batch]))
-            )
-        }
-        requested_ids = {item.image_id for item in batch}
-        log_context = {
-            "provider": self.vision_provider.provider_name,
-            "model": self.vision_provider.model_name,
-            "batch_number": batch_number,
-            "batch_size": len(batch),
-            "fallback_index": fallback_index,
-            "requested_ids": sorted(requested_ids),
-        }
-        summary.vision_batches_sent += 1
-        logger.info("vision_batch_sent", extra=log_context)
-        try:
-            results = self.vision_provider.analyze(batch)
-            mapped_ids = {result.image_id for result in results}
-            if mapped_ids != requested_ids:
-                if len(batch) == 1 and len(results) == 1:
-                    requested_id = next(iter(requested_ids))
-                    returned_id = results[0].image_id
-                    logger.warning(
-                        "vision_single_result_id_remapped",
-                        extra={**log_context, "returned_id": returned_id},
-                    )
-                    results = [replace(results[0], image_id=requested_id)]
-                    mapped_ids = requested_ids
-                else:
-                    raise VisionResultMappingError(requested_ids, mapped_ids)
-        except Exception:
-            summary.vision_batches_failed += 1
-            logger.exception("vision_batch_failed", extra=log_context)
-            raise
+        max_attempts: int,
+    ) -> list[tuple[ImageORM, ImageAnalysisResult]]:
+        analysis_batch = _with_batch_refs(batch)
+        reference_to_image = self._reference_to_image(analysis_batch)
+        log_context = self._vision_log_context(analysis_batch, batch_number, fallback_index)
+        last_error: VisionProviderError | None = None
+        for attempt in range(1, max_attempts + 1):
+            attempt_context = {**log_context, "attempt": attempt, "max_attempts": max_attempts}
+            self._mark_analysis_attempts(reference_to_image.values())
+            self.session.commit()
+            summary.vision_batches_sent += 1
+            summary.vision_batches_attempted += 1
+            logger.info("vision_batch_sent", extra=attempt_context)
+            try:
+                results = self.vision_provider.analyze(analysis_batch)
+                mapped_results = validate_vision_result_mapping(
+                    reference_to_image,
+                    results,
+                    log_context=attempt_context,
+                )
+            except VisionResponseMappingError as exc:
+                last_error = exc
+                summary.vision_batches_failed += 1
+                summary.vision_batch_mapping_failures += 1
+                logger.warning(
+                    "vision_batch_mapping_failed",
+                    extra={
+                        **attempt_context,
+                        "returned_refs": exc.returned_refs,
+                        "missing_refs": sorted(exc.missing_refs),
+                        "unexpected_refs": sorted(exc.unexpected_refs),
+                        "duplicate_refs": sorted(exc.duplicate_refs),
+                        "retry_strategy": _retry_strategy(attempt, max_attempts, len(batch)),
+                    },
+                )
+            except VisionProviderError as exc:
+                last_error = exc
+                summary.vision_batches_failed += 1
+                logger.warning(
+                    "vision_batch_provider_failed",
+                    extra={
+                        **attempt_context,
+                        "error_type": type(exc).__name__,
+                        "error": _sanitize_error(str(exc)),
+                        "retry_strategy": _retry_strategy(attempt, max_attempts, len(batch)),
+                    },
+                )
+            else:
+                summary.vision_batches_succeeded += 1
+                logger.info(
+                    "vision_batch_succeeded",
+                    extra={**attempt_context, "returned_refs": sorted(reference_to_image)},
+                )
+                return mapped_results
 
-        summary.vision_batches_succeeded += 1
-        logger.info(
-            "vision_batch_succeeded", extra={**log_context, "returned_ids": sorted(mapped_ids)}
-        )
-        return by_id, results
+            self.session.rollback()
+            if attempt < max_attempts:
+                summary.vision_batches_retried += 1
+                time.sleep(self.settings.vision_retry_backoff_seconds)
+
+        if last_error is None:
+            last_error = VisionProviderError("Vision provider failed without an exception")
+        raise last_error
 
     def _persist_vision_results(
         self,
-        by_id: dict[int, ImageORM],
-        results: list[ImageAnalysisResult],
+        mapped_results: list[tuple[ImageORM, ImageAnalysisResult]],
         summary: RunSummary,
     ) -> None:
-        for result in results:
-            image = by_id[result.image_id]
+        for image, result in mapped_results:
             positives = self.repo.persist_analysis(
                 image,
                 result,
                 analysis_version=self.settings.analysis_version,
             )
             summary.images_analyzed += 1
+            summary.images_analysis_succeeded += 1
             summary.positive_matches += positives
+
+    def _reference_to_image(self, batch: list[AnalysisImage]) -> dict[str, ImageORM]:
+        by_id = {
+            image.id: image
+            for image in self.session.scalars(
+                select(ImageORM).where(ImageORM.id.in_([item.image_id for item in batch]))
+            )
+        }
+        return {item.image_ref: by_id[item.image_id] for item in batch}
+
+    def _mark_analysis_attempts(self, images: Iterable[ImageORM]) -> None:
+        for image in images:
+            self.repo.mark_analysis_attempt(image)
+        self.session.flush()
+
+    def _mark_image_analysis_failed(
+        self,
+        item: AnalysisImage,
+        exc: VisionProviderError,
+        summary: RunSummary,
+    ) -> None:
+        image = self.session.get(ImageORM, item.image_id)
+        if image is None:
+            return
+        error = _sanitize_error(str(exc))
+        self.repo.mark_analysis_failed(image, error)
+        summary.images_analysis_failed += 1
+        logger.warning(
+            "vision_image_analysis_failed",
+            extra={
+                "provider": self.vision_provider.provider_name,
+                "model": self.vision_provider.model_name,
+                "image_id": item.image_id,
+                "sale_id": image.sale_id,
+                "error_type": type(exc).__name__,
+                "error": error,
+            },
+        )
+
+    def _vision_log_context(
+        self,
+        batch: list[AnalysisImage],
+        batch_number: int,
+        fallback_index: int | None = None,
+    ) -> dict[str, object]:
+        image_ids = [item.image_id for item in batch]
+        sale_ids = list(
+            self.session.scalars(select(ImageORM.sale_id).where(ImageORM.id.in_(image_ids)))
+        )
+        return {
+            "provider": self.vision_provider.provider_name,
+            "model": self.vision_provider.model_name,
+            "batch_number": batch_number,
+            "batch_size": len(batch),
+            "fallback_index": fallback_index,
+            "expected_refs": [item.image_ref for item in batch],
+            "image_ids": image_ids,
+            "sale_ids": sale_ids,
+        }
 
     def _send_digest(self, summary: RunSummary, options: RunOptions) -> None:
         detections = self.repo.unemailable_detections(limit=50)
@@ -370,3 +464,24 @@ class Pipeline:
         self.notifier.send_digest(detections)
         self.repo.mark_detections_emailed(detections)
         summary.email_status = "sent"
+
+
+def _with_batch_refs(batch: list[AnalysisImage]) -> list[AnalysisImage]:
+    return [
+        replace(item, image_ref=f"img_{index:04d}") for index, item in enumerate(batch, start=1)
+    ]
+
+
+def _retry_strategy(attempt: int, max_attempts: int, batch_size: int) -> str:
+    if attempt < max_attempts:
+        return "same_batch"
+    if batch_size > 1:
+        return "individual"
+    return "fail_image"
+
+
+def _sanitize_error(error: str, limit: int = 500) -> str:
+    sanitized = " ".join(error.split())
+    if len(sanitized) <= limit:
+        return sanitized
+    return sanitized[: limit - 3] + "..."

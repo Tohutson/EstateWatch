@@ -13,6 +13,7 @@ import httpx
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from estate_sale_finder.analysis.base import AnalysisImage
+from estate_sale_finder.analysis.errors import VisionProviderError, VisionResponseParseError
 from estate_sale_finder.analysis.prompts import (
     VISION_RESPONSE_SCHEMA,
     VISION_SYSTEM_PROMPT,
@@ -44,20 +45,20 @@ class ItemPayload(BaseModel):
         return value
 
 
-class ResultPayload(BaseModel):
-    image_id: int
+class VisionImageResult(BaseModel):
+    image_ref: str
     contains_target: bool
     items: list[ItemPayload]
 
     @model_validator(mode="after")
-    def validate_target_consistency(self) -> ResultPayload:
+    def validate_target_consistency(self) -> VisionImageResult:
         if self.contains_target != bool(self.items):
             raise ValueError("contains_target must match whether approved items are present")
         return self
 
 
-class ResponsePayload(BaseModel):
-    results: list[ResultPayload]
+class VisionBatchResponse(BaseModel):
+    results: list[VisionImageResult]
 
 
 class OpenAIVisionProvider:
@@ -127,6 +128,7 @@ class OpenAIVisionProvider:
                 )
             except (
                 httpx.HTTPError,
+                VisionProviderError,
                 ValidationError,
                 ValueError,
                 KeyError,
@@ -146,12 +148,7 @@ class OpenAIVisionProvider:
                 )
                 if attempt < self.settings.http_max_retries:
                     time.sleep(min(8.0, 0.5 * 2 ** (attempt - 1)))
-        if len(images) > 1 and _can_retry_individually(last_error):
-            results: list[ImageAnalysisResult] = []
-            for image in images:
-                results.extend(self._analyze_batch([image]))
-            return results
-        raise RuntimeError(f"OpenAI vision analysis failed: {last_error}") from last_error
+        raise _provider_error_from_exception(last_error) from last_error
 
     def _save_response_snapshot(
         self,
@@ -172,7 +169,7 @@ class OpenAIVisionProvider:
             "attempt": attempt,
             "status_code": status_code,
             "request_id": request_id,
-            "image_ids": [image.image_id for image in images],
+            "image_refs": [image.image_ref for image in images],
             "response": response_payload,
             "response_text": response_text,
         }
@@ -202,7 +199,7 @@ class OpenAIVisionProvider:
             "attempt": attempt,
             "status_code": status_code,
             "request_id": request_id,
-            "image_ids": [image.image_id for image in images],
+            "image_refs": [image.image_ref for image in images],
             "error_type": type(exc).__name__,
             "error": str(exc),
             "response": response_payload,
@@ -216,19 +213,27 @@ class OpenAIVisionProvider:
         )
         directory.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-        image_ids = "-".join(str(image_id) for image_id in snapshot["image_ids"])
-        filename = f"{timestamp}-{kind}-{image_ids[:80]}-{uuid4().hex[:8]}.json"
+        image_refs = "-".join(str(image_ref) for image_ref in snapshot["image_refs"])
+        filename = f"{timestamp}-{kind}-{image_refs[:80]}-{uuid4().hex[:8]}.json"
         path = directory / filename
         path.write_text(json.dumps(snapshot, indent=2, default=str), encoding="utf-8")
         logger.info(
             "openai_vision_response_saved",
-            extra={"path": str(path), "kind": kind, "image_ids": snapshot["image_ids"]},
+            extra={"path": str(path), "kind": kind, "image_refs": snapshot["image_refs"]},
         )
 
     def _request_payload(self, images: list[AnalysisImage]) -> dict[str, Any]:
         content: list[dict[str, Any]] = [{"type": "input_text", "text": VISION_USER_PROMPT}]
         for image in images:
-            content.append({"type": "input_text", "text": f"image_id={image.image_id}"})
+            content.append(
+                {
+                    "type": "input_text",
+                    "text": (
+                        f'The following image has immutable reference "{image.image_ref}". '
+                        "Return this exact value in image_ref."
+                    ),
+                }
+            )
             content.append(
                 {
                     "type": "input_image",
@@ -273,19 +278,21 @@ def _response_json(response: httpx.Response) -> dict[str, Any] | None:
     return {"payload": payload}
 
 
-def _can_retry_individually(exc: Exception | None) -> bool:
-    return isinstance(exc, (ValidationError, ValueError, KeyError, json.JSONDecodeError)) and not (
-        isinstance(exc, httpx.HTTPError)
-    )
-
-
-def _parse_response(payload: dict[str, Any]) -> ResponsePayload:
+def _parse_response(payload: dict[str, Any]) -> VisionBatchResponse:
+    if payload.get("status") == "incomplete":
+        raise VisionResponseParseError("OpenAI response was incomplete")
+    refusal = _find_refusal(payload.get("output", []))
+    if refusal:
+        raise VisionResponseParseError("OpenAI refused vision analysis")
     text = payload.get("output_text")
     if not text:
         text = _find_text(payload.get("output", []))
     if not isinstance(text, str):
-        raise ValueError("OpenAI response did not contain output text")
-    return ResponsePayload.model_validate_json(text)
+        raise VisionResponseParseError("OpenAI response did not contain output text")
+    try:
+        return VisionBatchResponse.model_validate_json(text)
+    except ValidationError as exc:
+        raise VisionResponseParseError(f"OpenAI structured response was invalid: {exc}") from exc
 
 
 def _find_text(output: Any) -> str | None:
@@ -302,8 +309,32 @@ def _find_text(output: Any) -> str | None:
     return None
 
 
+def _find_refusal(output: Any) -> str | None:
+    if isinstance(output, list):
+        for item in output:
+            found = _find_refusal(item)
+            if found:
+                return found
+    if isinstance(output, dict):
+        if output.get("type") == "refusal":
+            refusal = output.get("refusal") or output.get("text") or "refusal"
+            return str(refusal)
+        return _find_refusal(output.get("content"))
+    return None
+
+
+def _provider_error_from_exception(exc: Exception | None) -> VisionProviderError:
+    if isinstance(exc, VisionProviderError):
+        return exc
+    if exc is None:
+        return VisionProviderError("OpenAI vision analysis failed without an exception")
+    if isinstance(exc, (ValidationError, ValueError, KeyError, json.JSONDecodeError)):
+        return VisionResponseParseError(f"OpenAI vision analysis failed: {exc}")
+    return VisionProviderError(f"OpenAI vision analysis failed: {exc}")
+
+
 def _to_results(
-    parsed: ResponsePayload,
+    parsed: VisionBatchResponse,
     *,
     provider: str,
     model: str,
@@ -311,7 +342,7 @@ def _to_results(
 ) -> list[ImageAnalysisResult]:
     return [
         ImageAnalysisResult(
-            image_id=result.image_id,
+            image_ref=str(result.image_ref),
             contains_target=result.contains_target,
             items=[
                 DetectedItem(

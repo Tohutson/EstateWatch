@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     vision_model: str = "gpt-4.1-mini"
     vision_api_key: str | None = None
     vision_batch_size: int = 4
+    vision_max_batch_attempts: int = 2
+    vision_max_single_image_attempts: int = 2
+    vision_retry_backoff_seconds: float = 1.0
     vision_max_images_per_run: int | None = None
     openai_save_responses: bool = False
     openai_response_log_dir: Path | None = None
@@ -83,6 +86,20 @@ class Settings(BaseSettings):
     def validate_feature_settings(self) -> Settings:
         if self.analysis_provider == "openai" and not self.vision_api_key:
             raise ValueError("VISION_API_KEY is required when ANALYSIS_PROVIDER=openai")
+        retry_limits = {
+            "VISION_BATCH_SIZE": self.vision_batch_size,
+            "VISION_MAX_BATCH_ATTEMPTS": self.vision_max_batch_attempts,
+            "VISION_MAX_SINGLE_IMAGE_ATTEMPTS": self.vision_max_single_image_attempts,
+        }
+        invalid_retry_limits = [
+            name for name, value in retry_limits.items() if value < 1 or value > 25
+        ]
+        if invalid_retry_limits:
+            raise ValueError(
+                "Vision retry settings must be between 1 and 25: " + ", ".join(invalid_retry_limits)
+            )
+        if self.vision_retry_backoff_seconds < 0 or self.vision_retry_backoff_seconds > 300:
+            raise ValueError("VISION_RETRY_BACKOFF_SECONDS must be between 0 and 300")
         if self.email_enabled:
             missing = [
                 name

@@ -12,6 +12,7 @@ class AnalysisImage:
     image_id: int
     thumbnail_path: Path
     source_url: str
+    image_ref: str = ""
 
 
 class VisionProvider(Protocol):

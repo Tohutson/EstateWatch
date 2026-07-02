@@ -26,7 +26,7 @@ class MockVisionProvider:
                 items = []
             results.append(
                 ImageAnalysisResult(
-                    image_id=image.image_id,
+                    image_ref=image.image_ref,
                     contains_target=bool(items),
                     items=items,
                     provider=self.provider_name,

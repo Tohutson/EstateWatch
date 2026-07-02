@@ -15,15 +15,19 @@ VISION_SYSTEM_PROMPT = (
     "miniature golf objects, televisions showing golf, or unrelated household objects. Be "
     "conservative: do not guess when image quality is poor, do not invent a brand, model, "
     "age, or type, and use visible_brand only when a logo or marking is legible. Return "
-    "confidence from visual evidence. Return "
-    "modern_likelihood only for modern_camera and modern_camera_lens; use 0 for golf items. "
-    "Preserve the supplied image_id exactly and return an explicit non-match for images "
-    "without an approved target."
+    "confidence from visual evidence. Return modern_likelihood only for modern_camera and "
+    "modern_camera_lens; use 0 for golf items. Preserve the supplied image_ref exactly. "
+    "Never invent, transform, merge, omit, or duplicate image_ref values. Return an explicit "
+    "non-match for every image without an approved target, including blurry, irrelevant, or "
+    "unreadable images."
 )
 
 VISION_USER_PROMPT = (
-    "Return strict JSON with one result per supplied image_id. If an image has no approved "
-    "target, set contains_target=false and items=[]. Include only approved categories."
+    "Return strict JSON with exactly one result for every supplied image. Preserve image_ref "
+    "exactly as provided, never invent or transform it, never merge multiple images into one "
+    "result, and never return duplicate references. If an image has no approved target or "
+    "cannot be interpreted, return contains_target=false and items=[]. Include only approved "
+    "categories."
 )
 
 VISION_RESPONSE_SCHEMA = {
@@ -36,7 +40,7 @@ VISION_RESPONSE_SCHEMA = {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "image_id": {"type": "integer"},
+                    "image_ref": {"type": "string"},
                     "contains_target": {"type": "boolean"},
                     "items": {
                         "type": "array",
@@ -71,7 +75,7 @@ VISION_RESPONSE_SCHEMA = {
                         },
                     },
                 },
-                "required": ["image_id", "contains_target", "items"],
+                "required": ["image_ref", "contains_target", "items"],
             },
         }
     },

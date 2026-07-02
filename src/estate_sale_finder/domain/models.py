@@ -15,7 +15,9 @@ class GalleryStatus(StrEnum):
 class ImageStatus(StrEnum):
     DISCOVERED = "discovered"
     DOWNLOADED = "downloaded"
+    ANALYZING = "analyzing"
     ANALYZED = "analyzed"
+    FAILED = "failed"
     ERROR = "error"
 
 
@@ -123,7 +125,7 @@ def approved_detected_item(item: DetectedItem) -> DetectedItem | None:
 
 @dataclass(frozen=True)
 class ImageAnalysisResult:
-    image_id: int
+    image_ref: str
     contains_target: bool
     items: list[DetectedItem]
     provider: str
@@ -147,5 +149,11 @@ class RunSummary:
     vision_batches_sent: int = 0
     vision_batches_succeeded: int = 0
     vision_batches_failed: int = 0
+    vision_batches_attempted: int = 0
+    vision_batches_retried: int = 0
+    vision_batch_mapping_failures: int = 0
+    images_retried_individually: int = 0
+    images_analysis_failed: int = 0
+    images_analysis_succeeded: int = 0
     positive_matches: int = 0
     email_status: str = "not_sent"
