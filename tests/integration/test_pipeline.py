@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from estate_sale_finder.analysis.base import AnalysisImage
+from estate_sale_finder.analysis.errors import VisionProviderError
 from estate_sale_finder.config import Settings
 from estate_sale_finder.db.models import Base, DetectionORM, ImageORM, RunORM
 from estate_sale_finder.domain.models import (
@@ -106,7 +107,7 @@ class FakeVision:
         self.calls += len(images)
         return [
             ImageAnalysisResult(
-                image_id=image.image_id,
+                image_ref=image.image_ref,
                 contains_target=True,
                 items=[DetectedItem("modern_camera", "digital camera", 0.9, 0.8, None, "match")],
                 provider="fake",
@@ -129,7 +130,7 @@ class BadBatchVision:
         if len(images) > 1:
             return [
                 ImageAnalysisResult(
-                    image_id=0,
+                    image_ref="img_unknown",
                     contains_target=False,
                     items=[],
                     provider="fake",
@@ -139,7 +140,7 @@ class BadBatchVision:
             ]
         return [
             ImageAnalysisResult(
-                image_id=images[0].image_id,
+                image_ref=images[0].image_ref,
                 contains_target=False,
                 items=[],
                 provider="fake",
@@ -160,9 +161,76 @@ class BadSingleVision:
         self.calls += len(images)
         return [
             ImageAnalysisResult(
-                image_id=0,
+                image_ref="wrong_ref",
                 contains_target=False,
                 items=[],
+                provider="fake",
+                model_name="fake-model",
+                prompt_version="test",
+            )
+        ]
+
+
+class AlwaysFailVision:
+    provider_name = "fake"
+    model_name = "fake-model"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def analyze(self, images: list[AnalysisImage]) -> list[ImageAnalysisResult]:
+        self.calls += 1
+        raise VisionProviderError("provider parse failure with redacted payload")
+
+
+class MalformedThenMixedIndividualVision:
+    provider_name = "fake"
+    model_name = "fake-model"
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.single_attempts: dict[int, int] = {}
+
+    def analyze(self, images: list[AnalysisImage]) -> list[ImageAnalysisResult]:
+        self.calls.append([image.image_ref for image in images])
+        if len(images) > 1:
+            return [
+                ImageAnalysisResult(
+                    image_ref="img_0001",
+                    contains_target=True,
+                    items=[
+                        DetectedItem("modern_camera", "digital camera", 0.9, 0.8, None, "match")
+                    ],
+                    provider="fake",
+                    model_name="fake-model",
+                    prompt_version="test",
+                ),
+                ImageAnalysisResult(
+                    image_ref="img_0001",
+                    contains_target=False,
+                    items=[],
+                    provider="fake",
+                    model_name="fake-model",
+                    prompt_version="test",
+                ),
+                ImageAnalysisResult(
+                    image_ref="img_unknown",
+                    contains_target=False,
+                    items=[],
+                    provider="fake",
+                    model_name="fake-model",
+                    prompt_version="test",
+                ),
+            ]
+        image_id = images[0].image_id
+        self.single_attempts[image_id] = self.single_attempts.get(image_id, 0) + 1
+        if image_id == 2:
+            raise VisionProviderError("single image provider failure")
+        return [
+            ImageAnalysisResult(
+                image_ref=images[0].image_ref,
+                contains_target=True,
+                items=[DetectedItem("modern_camera", "digital camera", 0.9, 0.8, None, "match")],
                 provider="fake",
                 model_name="fake-model",
                 prompt_version="test",
@@ -427,14 +495,15 @@ def test_bad_batch_mapping_retries_images_individually(tmp_path: Path) -> None:
     pipeline.settings.vision_batch_size = 2
     summary = pipeline.run(RunOptions())
 
-    assert vision.batch_sizes == [2, 1, 1]
-    assert summary.vision_batches_sent == 3
-    assert summary.vision_batches_failed == 1
+    assert vision.batch_sizes == [2, 2, 1, 1]
+    assert summary.vision_batches_sent == 4
+    assert summary.vision_batches_failed == 2
     assert summary.vision_batches_succeeded == 2
     assert summary.images_analyzed == 2
+    assert summary.vision_batches_retried == 2
 
 
-def test_single_image_bad_id_is_remapped(tmp_path: Path) -> None:
+def test_single_image_bad_ref_is_corrected(tmp_path: Path) -> None:
     session = _session()
     vision = BadSingleVision()
     pipeline = Pipeline(
@@ -452,6 +521,80 @@ def test_single_image_bad_id_is_remapped(tmp_path: Path) -> None:
     assert summary.images_analyzed == 1
     assert image is not None
     assert image.status == "analyzed"
+
+
+def test_malformed_batch_retries_individually_and_marks_only_failed_image(
+    tmp_path: Path,
+) -> None:
+    session = _session()
+    source = FakeSource(
+        picture_urls=[
+            "https://example.test/image-1.jpg",
+            "https://example.test/image-2.jpg",
+            "https://example.test/image-3.jpg",
+        ]
+    )
+    vision = MalformedThenMixedIndividualVision()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=vision,
+    )
+    pipeline.settings.vision_batch_size = 3
+    pipeline.settings.vision_max_batch_attempts = 1
+    pipeline.settings.vision_max_single_image_attempts = 2
+    summary = pipeline.run(RunOptions())
+    images = list(session.scalars(select(ImageORM).order_by(ImageORM.id)))
+    detections = list(session.scalars(select(DetectionORM).order_by(DetectionORM.image_id)))
+
+    assert vision.calls == [
+        ["img_0001", "img_0002", "img_0003"],
+        ["img_0001"],
+        ["img_0001"],
+        ["img_0001"],
+        ["img_0001"],
+    ]
+    assert summary.vision_batch_mapping_failures == 1
+    assert summary.images_retried_individually == 3
+    assert summary.images_analysis_failed == 1
+    assert summary.images_analysis_succeeded == 2
+    assert summary.images_analyzed == 2
+    assert [image.status for image in images] == ["analyzed", "failed", "analyzed"]
+    assert images[1].analyzed_at is None
+    assert images[1].last_analysis_error is not None
+    assert len(detections) == 2
+    assert [detection.image_id for detection in detections] == [images[0].id, images[2].id]
+
+
+def test_failed_image_is_retryable_without_duplicate_prior_successes(tmp_path: Path) -> None:
+    session = _session()
+    source = FakeSource(picture_urls=["https://example.test/image-1.jpg"])
+    failing = AlwaysFailVision()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=failing,
+    )
+    pipeline.settings.vision_max_batch_attempts = 1
+    first = pipeline.run(RunOptions())
+    image = session.scalar(select(ImageORM))
+
+    assert first.images_analysis_failed == 1
+    assert image is not None
+    assert image.status == "failed"
+    assert image.analyzed_at is None
+
+    pipeline.vision_provider = FakeVision()
+    second = pipeline.run(RunOptions())
+
+    assert second.images_analyzed == 1
+    assert image.status == "analyzed"
+    assert image.analysis_attempt_count == 2
+    assert len(list(session.scalars(select(DetectionORM)))) == 1
 
 
 def test_vision_max_images_per_run_limits_analysis(tmp_path: Path) -> None:

@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 
 import pytest
-from pydantic import ValidationError
 
+from estate_sale_finder.analysis.errors import VisionResponseParseError
 from estate_sale_finder.analysis.openai_vision import _parse_response
 from estate_sale_finder.analysis.prompts import VISION_RESPONSE_SCHEMA
 from estate_sale_finder.domain.models import APPROVED_TARGET_CATEGORIES, CAMERA_TARGET_CATEGORIES
@@ -33,7 +33,7 @@ def test_openai_response_accepts_each_approved_category() -> None:
             {
                 "results": [
                     {
-                        "image_id": index,
+                        "image_ref": f"img_{index:04d}",
                         "contains_target": True,
                         "items": [
                             {
@@ -65,7 +65,7 @@ def test_openai_response_rejects_unexpected_category() -> None:
             {
                 "results": [
                     {
-                        "image_id": 1,
+                        "image_ref": "img_0001",
                         "contains_target": True,
                         "items": [
                             {
@@ -83,14 +83,14 @@ def test_openai_response_rejects_unexpected_category() -> None:
         )
     }
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(VisionResponseParseError):
         _parse_response(payload)
 
 
 def test_non_match_result_is_explicit() -> None:
     payload = {
         "output_text": json.dumps(
-            {"results": [{"image_id": 1, "contains_target": False, "items": []}]}
+            {"results": [{"image_ref": "img_0001", "contains_target": False, "items": []}]}
         )
     }
 
@@ -98,3 +98,10 @@ def test_non_match_result_is_explicit() -> None:
 
     assert parsed.results[0].contains_target is False
     assert parsed.results[0].items == []
+
+
+def test_openai_response_rejects_missing_image_ref() -> None:
+    payload = {"output_text": json.dumps({"results": [{"contains_target": False, "items": []}]})}
+
+    with pytest.raises(VisionResponseParseError):
+        _parse_response(payload)

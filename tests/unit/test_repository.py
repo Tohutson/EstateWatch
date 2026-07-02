@@ -71,7 +71,7 @@ def test_detection_persistence_and_email_status() -> None:
     repo.persist_analysis(
         image,
         ImageAnalysisResult(
-            image_id=image.id,
+            image_ref="img_0001",
             contains_target=True,
             items=[
                 DetectedItem("modern_camera", "mirrorless camera", 0.9, 0.8, "Sony", "visible body")
@@ -97,7 +97,7 @@ def test_unknown_detection_categories_are_not_persisted() -> None:
     positives = repo.persist_analysis(
         image,
         ImageAnalysisResult(
-            image_id=image.id,
+            image_ref="img_0001",
             contains_target=True,
             items=[
                 DetectedItem(

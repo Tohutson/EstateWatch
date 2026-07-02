@@ -7,6 +7,7 @@ import pytest
 from PIL import Image
 
 from estate_sale_finder.analysis.base import AnalysisImage
+from estate_sale_finder.analysis.errors import VisionProviderError
 from estate_sale_finder.analysis.openai_vision import OpenAIVisionProvider
 from estate_sale_finder.config import Settings
 
@@ -40,11 +41,11 @@ def test_http_errors_do_not_split_batch_into_individual_requests(tmp_path: Path)
         ),
     )
 
-    with pytest.raises(RuntimeError, match="429 Too Many Requests"):
+    with pytest.raises(VisionProviderError, match="429 Too Many Requests"):
         provider.analyze(
             [
-                AnalysisImage(1, thumb, "https://example.test/1.jpg"),
-                AnalysisImage(2, thumb, "https://example.test/2.jpg"),
+                AnalysisImage(1, thumb, "https://example.test/1.jpg", "img_0001"),
+                AnalysisImage(2, thumb, "https://example.test/2.jpg", "img_0002"),
             ]
         )
 
