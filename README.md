@@ -57,9 +57,11 @@ Configuration is loaded from environment variables and `.env`. Important default
 
 Set `ANALYSIS_PROVIDER=openai`, `VISION_API_KEY`, and `VISION_MODEL` to use the hosted vision provider. SMTP uses `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS`, `EMAIL_FROM`, and comma-separated `EMAIL_TO`.
 
+Vision analysis uses batch-local image references such as `img_0001`, not raw database IDs, at the provider boundary. Retry controls have safe defaults: `VISION_BATCH_SIZE=4`, `VISION_MAX_BATCH_ATTEMPTS=2`, `VISION_MAX_SINGLE_IMAGE_ATTEMPTS=2`, and `VISION_RETRY_BACKOFF_SECONDS=1`. Setting `VISION_BATCH_SIZE=1` is a conservative troubleshooting option for provider mapping issues, but normal production batching remains supported.
+
 Use `VISION_MAX_IMAGES_PER_RUN` as a paid-call safety valve during diagnostics or backlog catch-up. For example, `VISION_MAX_IMAGES_PER_RUN=5` analyzes at most five eligible images in one run and leaves the rest for later idempotent runs. Leave it empty for no cap.
 
-Set `OPENAI_SAVE_RESPONSES=true` to save raw OpenAI response snapshots under `DATA_DIR/logs/openai-responses` by default, or set `OPENAI_RESPONSE_LOG_DIR` to choose another directory. Snapshots include image IDs, status codes, request IDs, response bodies, and error bodies, but not the API key or base64 image request payload.
+Set `OPENAI_SAVE_RESPONSES=true` to save raw OpenAI response snapshots under `DATA_DIR/logs/openai-responses` by default, or set `OPENAI_RESPONSE_LOG_DIR` to choose another directory. Snapshots include image references, status codes, request IDs, response bodies, and error bodies, but not the API key or base64 image request payload.
 
 Keep `.env` mode restrictive on the server:
 
@@ -95,11 +97,19 @@ The process lock prevents overlapping runs. If a previous process was interrupte
 
 `LOCAL_PREFILTER_ENABLED=false` by default. When enabled with the optional `prefilter` dependency, the app lazily loads `open-clip-torch` and caches model files under `XDG_CACHE_HOME` (`/app/model-cache` in Docker). The threshold is recall-oriented and must be tuned with saved scores in the database.
 
-Each run logs `local_prefilter_complete` with `images_prefiltered`, `images_prefilter_passed`, and `images_prefilter_rejected`. The final `run_complete` log includes those counters plus `vision_batches_sent`, `vision_batches_succeeded`, and `vision_batches_failed`.
+Each run logs `local_prefilter_complete` with `images_prefiltered`, `images_prefilter_passed`, and `images_prefilter_rejected`. The final `run_complete` log includes those counters plus `vision_batches_sent`, `vision_batches_succeeded`, `vision_batches_failed`, `vision_batches_attempted`, `vision_batches_retried`, `vision_batch_mapping_failures`, `images_retried_individually`, `images_analysis_succeeded`, and `images_analysis_failed`.
 
 When `ANALYSIS_PROVIDER=openai`, the OpenAI provider logs `openai_vision_request_sent`, `openai_vision_request_succeeded`, and `openai_vision_request_failed` events. Successful request logs include the HTTP status code and OpenAI request ID when the API returns one.
 
-If OpenAI returns a single result with an incorrect `image_id` for a one-image request, the pipeline remaps that result to the requested image and logs `vision_single_result_id_remapped`. Multi-image response mismatches still trigger an individual-image retry so the run does not silently attach results to the wrong records.
+### Vision response mapping failures
+
+Every vision batch sends each thumbnail immediately after an immutable batch-local `image_ref`, and the provider must return exactly one result per supplied reference. The pipeline rejects missing, unexpected, duplicate, or extra references after structured-output validation. It deliberately refuses multi-image positional mapping because attaching detections to the wrong image is worse than retrying.
+
+When a batch mapping or parse failure occurs, the run logs `vision_batch_mapping_failed` or `vision_batch_provider_failed` with provider, model, batch size, expected references, returned references when available, missing, unexpected, duplicate references, image IDs, sale IDs, attempt number, and retry strategy. Logs do not include API keys, authorization headers, SMTP credentials, image base64, or binary image data.
+
+The retry policy is bounded. A failed configured batch is retried up to `VISION_MAX_BATCH_ATTEMPTS`; if it still fails and contains more than one image, the pipeline retries each image individually up to `VISION_MAX_SINGLE_IMAGE_ATTEMPTS`. One malformed image is marked `failed` with a bounded sanitized error and remains retryable in a later run. Successful images in the same original batch are persisted normally and are not repeated on the next idempotent run. A single-image response with one wrong or missing reference may be corrected only when unambiguous, and logs `vision_single_result_ref_corrected`.
+
+Use `VISION_BATCH_SIZE=1` temporarily if you need to troubleshoot a provider that repeatedly returns malformed multi-image references. This is a fallback diagnostic mode, not a requirement for normal production operation. Partial success is represented in the run summary by nonzero `images_analysis_failed`; the CLI still exits `0` for isolated provider image failures, while configuration, database, discovery, and other fatal failures remain nonzero.
 
 ## Testing
 
