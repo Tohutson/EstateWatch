@@ -56,8 +56,8 @@ class Settings(BaseSettings):
     vision_max_images_per_run: int | None = None
     openai_save_responses: bool = False
     openai_response_log_dir: Path | None = None
-    analysis_version: str = "golf-camera-v2"
-    prompt_version: str = "targets-v2"
+    analysis_version: str = "multi-watchlist-v1"
+    prompt_version: str = "targets-multi-v1"
     local_prefilter_enabled: bool = False
     local_prefilter_model: str = "ViT-B-32/laion2b_s34b_b79k"
     local_prefilter_threshold: float = 0.20
@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = True
     email_from: str | None = None
     email_to: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    watchlist_config_path: Path | None = None
 
     @field_validator("allowed_sale_types", "email_to", mode="before")
     @classmethod
@@ -81,6 +82,11 @@ class Settings(BaseSettings):
     @classmethod
     def expand_data_dir(cls, value: Path) -> Path:
         return value.expanduser()
+
+    @field_validator("watchlist_config_path", mode="after")
+    @classmethod
+    def expand_watchlist_config_path(cls, value: Path | None) -> Path | None:
+        return value.expanduser() if value else None
 
     @model_validator(mode="after")
     def validate_feature_settings(self) -> Settings:
@@ -106,10 +112,11 @@ class Settings(BaseSettings):
                 for name, value in {
                     "SMTP_HOST": self.smtp_host,
                     "EMAIL_FROM": self.email_from,
-                    "EMAIL_TO": self.email_to,
                 }.items()
                 if not value
             ]
+            if not self.watchlist_config_path and not self.email_to:
+                missing.append("EMAIL_TO")
             if missing:
                 raise ValueError(f"Missing email settings: {', '.join(missing)}")
         return self

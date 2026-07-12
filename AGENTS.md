@@ -8,7 +8,12 @@
 - Isolate provider failures to the smallest safe image unit; one malformed response must not abort the full run.
 - Keep EstateSales.NET behavior isolated in `src/estate_sale_finder/sources/estatesales_net.py`.
 - Add fixture-based parser tests whenever sale-page or API parsing changes.
-- Current targets are only golf clubs, golf bags, golf balls, modern digital cameras, and modern camera lenses.
+- Current approved targets are centralized in `TargetCategory`: golf clubs, golf bags, golf balls, modern digital cameras, modern camera lenses, collectible perfume bottles, and jewelry.
+- Do not hardcode recipient-specific logic; use watchlist configuration and routing.
+- Do not reintroduce a single global email-sent flag; notification idempotency is per detection, watchlist, and recipient.
+- Do not add categories outside the central allowlist.
+- Do not duplicate image analysis per watchlist unless deliberately justified and versioned.
+- Keep watchlist routing tested.
 - Never commit secrets, `.env`, database files, thumbnails, model caches, or live credentials.
 - Run formatting, Ruff, mypy, tests, CLI help, and migrations before handing work back.
 - Update Alembic migrations when the schema changes.

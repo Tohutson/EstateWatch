@@ -1,0 +1,24 @@
+{
+  "watchlists": [
+    {
+      "id": "golf_camera",
+      "name": "Golf and Camera Finds",
+      "recipients": ["user@example.com"],
+      "targets": [
+        "golf_clubs",
+        "golf_bag",
+        "golf_balls",
+        "modern_camera",
+        "modern_camera_lens"
+      ],
+      "send_on_no_matches": false
+    },
+    {
+      "id": "perfume_jewelry",
+      "name": "Perfume and Jewelry Finds",
+      "recipients": ["other@example.com"],
+      "targets": ["collectible_perfume_bottle", "jewelry"],
+      "send_on_no_matches": false
+    }
+  ]
+}

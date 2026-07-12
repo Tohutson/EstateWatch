@@ -5,9 +5,11 @@ from datetime import UTC, datetime
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from estate_sale_finder.db.models import Base, DetectionORM
+from estate_sale_finder.db.models import Base, DetectionNotificationORM, DetectionORM
 from estate_sale_finder.db.repository import Repository, sale_has_changed
 from estate_sale_finder.domain.models import DetectedItem, ImageAnalysisResult, Sale, SalePicture
+from estate_sale_finder.routing import matching_watchlists
+from estate_sale_finder.watchlists import WatchlistProfile
 
 
 def _session() -> Session:
@@ -88,6 +90,126 @@ def test_detection_persistence_and_email_status() -> None:
     assert repo.unemailable_detections(limit=10) == []
 
 
+def test_watchlist_routing_by_category() -> None:
+    golf = _profile("golf_camera", ["golf_bag", "modern_camera"])
+    jewelry = _profile("perfume_jewelry", ["collectible_perfume_bottle", "jewelry"])
+
+    assert matching_watchlists("golf_bag", [golf, jewelry]) == [golf]
+    assert matching_watchlists("jewelry", [golf, jewelry]) == [jewelry]
+    assert matching_watchlists("modern_camera", [golf, jewelry]) == [golf]
+    assert matching_watchlists("legacy_category", [golf, jewelry]) == []
+
+
+def test_pending_notifications_are_per_watchlist_and_recipient() -> None:
+    session = _session()
+    repo = Repository(session)
+    sale_orm, _, _ = repo.upsert_sale(_sale())
+    image, _ = repo.upsert_image(sale_orm, SalePicture(None, "https://example.test/a.jpg"))
+    image.status = "downloaded"
+    repo.persist_analysis(
+        image,
+        ImageAnalysisResult(
+            image_ref="img_0001",
+            contains_target=True,
+            items=[
+                DetectedItem("golf_bag", "golf bag", 0.9, 0.0, None, "visible"),
+                DetectedItem("jewelry", "rings", 0.9, 0.0, None, "visible"),
+            ],
+            provider="mock",
+            model_name="mock",
+            prompt_version="mock",
+        ),
+        analysis_version="v1",
+    )
+    golf = _profile("golf_camera", ["golf_bag"])
+    jewelry = _profile("perfume_jewelry", ["jewelry"])
+    repo.sync_watchlists([golf, jewelry])
+    session.commit()
+
+    golf_pending = repo.pending_detections_for_watchlist(golf, "golf@example.test", limit=10)
+    jewelry_pending = repo.pending_detections_for_watchlist(
+        jewelry, "jewelry@example.test", limit=10
+    )
+
+    assert [detection.category for detection in golf_pending] == ["golf_bag"]
+    assert [detection.category for detection in jewelry_pending] == ["jewelry"]
+
+    repo.mark_notifications_sent(
+        golf_pending,
+        watchlist_id=golf.id,
+        recipient="golf@example.test",
+        email_run_id=None,
+    )
+    session.commit()
+
+    assert repo.pending_detections_for_watchlist(golf, "golf@example.test", limit=10) == []
+    assert repo.pending_detections_for_watchlist(golf, "other@example.test", limit=10)
+
+
+def test_same_detection_can_be_sent_to_multiple_matching_watchlists() -> None:
+    session = _session()
+    repo = Repository(session)
+    sale_orm, _, _ = repo.upsert_sale(_sale())
+    image, _ = repo.upsert_image(sale_orm, SalePicture(None, "https://example.test/a.jpg"))
+    image.status = "downloaded"
+    repo.persist_analysis(
+        image,
+        ImageAnalysisResult(
+            image_ref="img_0001",
+            contains_target=True,
+            items=[DetectedItem("jewelry", "rings", 0.9, 0.0, None, "visible")],
+            provider="mock",
+            model_name="mock",
+            prompt_version="mock",
+        ),
+        analysis_version="v1",
+    )
+    first = _profile("perfume_jewelry", ["jewelry"])
+    second = _profile("collector", ["jewelry"])
+    repo.sync_watchlists([first, second])
+    session.commit()
+
+    assert repo.pending_detections_for_watchlist(first, "a@example.test", limit=10)
+    assert repo.pending_detections_for_watchlist(second, "b@example.test", limit=10)
+
+
+def test_legacy_email_state_is_seeded_for_primary_watchlist_only() -> None:
+    session = _session()
+    repo = Repository(session)
+    sale_orm, _, _ = repo.upsert_sale(_sale())
+    image, _ = repo.upsert_image(sale_orm, SalePicture(None, "https://example.test/a.jpg"))
+    detection = DetectionORM(
+        image_id=image.id,
+        category="modern_camera",
+        label="camera",
+        confidence=0.9,
+        modern_likelihood=0.8,
+        visible_brand=None,
+        notes=None,
+        model_provider="mock",
+        model_name="mock",
+        prompt_version="old",
+        analysis_version="old",
+        created_at=datetime(2026, 7, 1, tzinfo=UTC),
+        included_in_email=True,
+        email_sent_at=datetime(2026, 7, 2, tzinfo=UTC),
+    )
+    session.add(detection)
+    golf = _profile("golf_camera", ["modern_camera"], recipients=("legacy@example.test",))
+    other = _profile("new_camera_watch", ["modern_camera"], recipients=("new@example.test",))
+    repo.sync_watchlists([golf, other])
+    repo.seed_legacy_notification_state([golf, other])
+    session.commit()
+
+    notifications = list(session.query(DetectionNotificationORM).all())
+
+    assert [(row.watchlist_id, row.recipient_email) for row in notifications] == [
+        ("golf_camera", "legacy@example.test")
+    ]
+    assert repo.pending_detections_for_watchlist(golf, "legacy@example.test", limit=10) == []
+    assert repo.pending_detections_for_watchlist(other, "new@example.test", limit=10)
+
+
 def test_unknown_detection_categories_are_not_persisted() -> None:
     session = _session()
     repo = Repository(session)
@@ -156,3 +278,18 @@ def test_analysis_version_logic() -> None:
     assert repo.images_to_analyze(
         analysis_version="v2", reanalyze=False, version_mismatch=True
     ) == [image]
+
+
+def _profile(
+    watchlist_id: str,
+    targets: list[str],
+    *,
+    recipients: tuple[str, ...] = ("user@example.test",),
+) -> WatchlistProfile:
+    return WatchlistProfile(
+        id=watchlist_id,
+        name=watchlist_id,
+        recipients=recipients,
+        targets=frozenset(targets),
+        config_hash=watchlist_id,
+    )

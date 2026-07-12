@@ -111,6 +111,68 @@ class DetectionORM(Base):
     email_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     image: Mapped[ImageORM] = relationship(back_populates="detections")
+    notifications: Mapped[list[DetectionNotificationORM]] = relationship(
+        back_populates="detection", cascade="all, delete-orphan"
+    )
+
+
+class WatchlistORM(Base):
+    __tablename__ = "watchlists"
+
+    id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    name: Mapped[str] = mapped_column(String(300), nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    targets: Mapped[list[WatchlistTargetORM]] = relationship(
+        back_populates="watchlist", cascade="all, delete-orphan"
+    )
+
+
+class WatchlistTargetORM(Base):
+    __tablename__ = "watchlist_targets"
+    __table_args__ = (
+        UniqueConstraint(
+            "watchlist_id",
+            "category",
+            name="uq_watchlist_targets_watchlist_category",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    watchlist_id: Mapped[str] = mapped_column(
+        ForeignKey("watchlists.id", ondelete="CASCADE"), nullable=False
+    )
+    category: Mapped[str] = mapped_column(String(80), nullable=False)
+
+    watchlist: Mapped[WatchlistORM] = relationship(back_populates="targets")
+
+
+class DetectionNotificationORM(Base):
+    __tablename__ = "detection_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "detection_id",
+            "watchlist_id",
+            "recipient_email",
+            name="uq_detection_notifications_detection_watchlist_recipient",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    detection_id: Mapped[int] = mapped_column(
+        ForeignKey("detections.id", ondelete="CASCADE"), nullable=False
+    )
+    watchlist_id: Mapped[str] = mapped_column(
+        ForeignKey("watchlists.id", ondelete="CASCADE"), nullable=False
+    )
+    recipient_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    email_run_id: Mapped[int | None] = mapped_column(ForeignKey("runs.id", ondelete="SET NULL"))
+
+    detection: Mapped[DetectionORM] = relationship(back_populates="notifications")
 
 
 class RunORM(Base):

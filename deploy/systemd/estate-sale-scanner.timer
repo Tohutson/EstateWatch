@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Estate Sale Finder daily
+Description=Run Estate Sale Finder weekly
 
 [Timer]
-OnCalendar=*-*-* 06:15:00
+OnCalendar=Wed *-*-* 09:00:00
 Persistent=true
 
 [Install]

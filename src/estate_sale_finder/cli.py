@@ -19,6 +19,7 @@ from estate_sale_finder.logging_config import configure_logging
 from estate_sale_finder.notifications.smtp import SmtpNotifier
 from estate_sale_finder.pipeline import Pipeline, RunOptions
 from estate_sale_finder.sources.estatesales_net import EstateSalesNetClient
+from estate_sale_finder.watchlists import active_target_categories, load_watchlists
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +30,17 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run")
     run.add_argument("--reanalyze", action="store_true")
     run.add_argument("--reanalyze-version-mismatch", action="store_true")
+    run.add_argument("--reanalyze-active", action="store_true")
     run.add_argument("--sale-id")
     run.add_argument("--dry-run", action="store_true")
+    run.add_argument("--watchlist")
+    watchlists = sub.add_parser("watchlists")
+    watchlists_sub = watchlists.add_subparsers(dest="watchlists_command", required=True)
+    watchlists_sub.add_parser("validate")
+    watchlists_sub.add_parser("list")
+    backfill = sub.add_parser("backfill-watchlist")
+    backfill.add_argument("watchlist_id")
+    backfill.add_argument("--active-only", action="store_true")
     sub.add_parser("doctor")
     sub.add_parser("migrate")
     sub.add_parser("test-email")
@@ -49,9 +59,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "doctor":
         return doctor(settings)
+    if args.command == "watchlists":
+        return watchlists_command(settings, args.watchlists_command)
+    if args.command == "backfill-watchlist":
+        args.watchlist = args.watchlist_id
+        args.reanalyze = False
+        args.reanalyze_version_mismatch = True
+        args.reanalyze_active = args.active_only
+        args.sale_id = None
+        args.dry_run = False
+        return run_once(settings, args)
     if args.command == "test-email":
         notifier = SmtpNotifier(settings)
-        notifier.send_failure("Estate Sale Finder test email", "SMTP configuration works.")
+        for recipient in _configured_recipients(settings):
+            notifier.send_test(recipient)
         return 0
     if args.command == "inspect-sale":
         return inspect_sale(settings, args.sale_id)
@@ -67,6 +88,11 @@ def run_once(settings: Settings, args: argparse.Namespace) -> int:
             logger.info("run_skipped_lock_held", extra={"lock_path": str(lock_path)})
             return 0
         upgrade_to_head(settings.resolved_database_url)
+        watchlists = load_watchlists(
+            settings,
+            selected_id=args.watchlist,
+            require_recipients=settings.email_enabled,
+        )
         engine = make_engine(settings.resolved_database_url)
         factory = make_session_factory(engine)
         with session_scope(factory) as session:
@@ -77,16 +103,23 @@ def run_once(settings: Settings, args: argparse.Namespace) -> int:
                 session=session,
                 source=source,
                 downloader=downloader,
-                vision_provider=_vision_provider(settings),
+                vision_provider=_vision_provider(
+                    settings,
+                    active_target_categories(watchlists),
+                ),
                 notifier=SmtpNotifier(settings) if settings.email_enabled else None,
                 prefilter=_prefilter(settings),
+                watchlists=watchlists,
             )
             pipeline.run(
                 RunOptions(
                     reanalyze=args.reanalyze,
-                    reanalyze_version_mismatch=args.reanalyze_version_mismatch,
+                    reanalyze_version_mismatch=(
+                        args.reanalyze_version_mismatch or args.reanalyze_active
+                    ),
                     sale_id=args.sale_id,
                     dry_run=args.dry_run,
+                    active_only=args.reanalyze_active,
                 )
             )
     return 0
@@ -109,12 +142,31 @@ def doctor(settings: Settings) -> int:
     location = source.resolve_postal_code(settings.postal_code)
     if settings.analysis_provider == "openai" and not settings.vision_api_key:
         raise RuntimeError("OpenAI vision provider is selected but VISION_API_KEY is missing")
-    if settings.email_enabled and (
-        not settings.smtp_host or not settings.email_from or not settings.email_to
-    ):
+    load_watchlists(
+        settings,
+        require_recipients=bool(settings.watchlist_config_path) or settings.email_enabled,
+    )
+    if settings.email_enabled and (not settings.smtp_host or not settings.email_from):
         raise RuntimeError("Email is enabled but SMTP settings are incomplete")
     logger.info("doctor_ok", extra={"postal_code": location.postal_code})
     return 0
+
+
+def watchlists_command(settings: Settings, command: str) -> int:
+    profiles = load_watchlists(settings, require_recipients=True)
+    if command == "validate":
+        print(f"Validated {len(profiles)} watchlist{'s' if len(profiles) != 1 else ''}.")
+        return 0
+    if command == "list":
+        for profile in profiles:
+            print(
+                f"{profile.id}\t{profile.name}\t"
+                f"{len(profile.recipients)} recipient"
+                f"{'s' if len(profile.recipients) != 1 else ''}\t"
+                f"{', '.join(sorted(profile.targets))}"
+            )
+        return 0
+    return 2
 
 
 def inspect_sale(settings: Settings, sale_id: str) -> int:
@@ -144,9 +196,24 @@ def _assert_writable(path: Path) -> None:
     test.unlink()
 
 
-def _vision_provider(settings: Settings) -> VisionProvider:
+def _configured_recipients(settings: Settings) -> list[str]:
+    profiles = load_watchlists(settings, require_recipients=True)
+    recipients: list[str] = []
+    seen: set[str] = set()
+    for profile in profiles:
+        for recipient in profile.recipients:
+            if recipient not in seen:
+                recipients.append(recipient)
+                seen.add(recipient)
+    return recipients
+
+
+def _vision_provider(
+    settings: Settings,
+    target_categories: set[str] | frozenset[str],
+) -> VisionProvider:
     if settings.analysis_provider == "openai":
-        return OpenAIVisionProvider(settings)
+        return OpenAIVisionProvider(settings, target_categories=target_categories)
     return MockVisionProvider()
 
 

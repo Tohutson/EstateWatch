@@ -1,7 +1,9 @@
 <!doctype html>
 <html>
   <body style="font-family: Arial, sans-serif; color: #17202a;">
-    <h1 style="font-size: 20px;">Estate Sale Finder</h1>
+    <h1 style="font-size: 20px;">EstateWatch: {{ watchlist.name }}</h1>
+    <p style="color: #555;">Targets: {{ target_categories|join(", ") }}</p>
+    {% if count %}
     <p>{{ count }} new likely match{% if count != 1 %}es{% endif %}.</p>
     {% for sale, detections in groups %}
       <section style="border-top: 1px solid #ddd; padding: 14px 0;">
@@ -32,5 +34,8 @@
         {% endfor %}
       </section>
     {% endfor %}
+    {% else %}
+      <p>No new matches for this watchlist.</p>
+    {% endif %}
   </body>
 </html>

@@ -1,5 +1,8 @@
-Estate Sale Finder
+EstateWatch - {{ watchlist.name }}
 
+Targets: {{ target_categories|join(", ") }}
+
+{% if count %}
 {{ count }} new likely match{% if count != 1 %}es{% endif %}.
 
 {% for sale, detections in groups %}
@@ -16,3 +19,6 @@ Estate Sale Finder
 {% endfor %}
 
 {% endfor %}
+{% else %}
+No new matches for this watchlist.
+{% endif %}

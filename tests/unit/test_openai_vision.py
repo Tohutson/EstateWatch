@@ -50,3 +50,30 @@ def test_http_errors_do_not_split_batch_into_individual_requests(tmp_path: Path)
         )
 
     assert requests == 2
+
+
+def test_openai_payload_uses_configured_target_categories(tmp_path: Path) -> None:
+    thumb = tmp_path / "thumb.jpg"
+    Image.new("RGB", (16, 16), "blue").save(thumb, format="JPEG")
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path,
+        analysis_provider="openai",
+        vision_api_key="test-key",
+    )
+    provider = OpenAIVisionProvider(
+        settings,
+        client=httpx.Client(base_url="https://api.openai.test/v1"),
+        target_categories=frozenset({"jewelry"}),
+    )
+
+    payload = provider._request_payload(
+        [AnalysisImage(1, thumb, "https://example.test/1.jpg", "img_0001")]
+    )
+    schema = payload["text"]["format"]["schema"]
+
+    assert "jewelry:" in payload["instructions"]
+    assert "golf_bag:" not in payload["instructions"]
+    assert schema["properties"]["results"]["items"]["properties"]["items"]["items"]["properties"][
+        "category"
+    ]["enum"] == ["jewelry"]

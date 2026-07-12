@@ -27,9 +27,20 @@ class TargetCategory(StrEnum):
     GOLF_BALLS = "golf_balls"
     MODERN_CAMERA = "modern_camera"
     MODERN_CAMERA_LENS = "modern_camera_lens"
+    COLLECTIBLE_PERFUME_BOTTLE = "collectible_perfume_bottle"
+    JEWELRY = "jewelry"
 
 
 APPROVED_TARGET_CATEGORIES = frozenset(category.value for category in TargetCategory)
+DEFAULT_TARGET_CATEGORIES = frozenset(
+    {
+        TargetCategory.GOLF_CLUBS.value,
+        TargetCategory.GOLF_BAG.value,
+        TargetCategory.GOLF_BALLS.value,
+        TargetCategory.MODERN_CAMERA.value,
+        TargetCategory.MODERN_CAMERA_LENS.value,
+    }
+)
 CAMERA_TARGET_CATEGORIES = frozenset(
     {TargetCategory.MODERN_CAMERA.value, TargetCategory.MODERN_CAMERA_LENS.value}
 )
