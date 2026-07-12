@@ -185,7 +185,7 @@ class Repository:
         if sale_db_id is not None:
             stmt = stmt.where(ImageORM.sale_id == sale_db_id)
         if active_only:
-            stmt = stmt.join(ImageORM.sale).where(SaleORM.active.is_(True))
+            stmt = stmt.join(ImageORM.sale).where(SaleORM.last_end_at >= utc_now())
         if not reanalyze:
             if version_mismatch:
                 stmt = stmt.where(

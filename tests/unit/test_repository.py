@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -9,6 +9,7 @@ from estate_sale_finder.db.models import Base, DetectionNotificationORM, Detecti
 from estate_sale_finder.db.repository import Repository, sale_has_changed
 from estate_sale_finder.domain.models import DetectedItem, ImageAnalysisResult, Sale, SalePicture
 from estate_sale_finder.routing import matching_watchlists
+from estate_sale_finder.utils.dates import utc_now
 from estate_sale_finder.watchlists import WatchlistProfile
 
 
@@ -18,12 +19,18 @@ def _session() -> Session:
     return sessionmaker(engine, expire_on_commit=False, future=True)()
 
 
-def _sale(pictures: int = 5, modified: datetime | None = None) -> Sale:
+def _sale(
+    *,
+    external_id: str = "1",
+    pictures: int = 5,
+    modified: datetime | None = None,
+    last_end_at: datetime | None = None,
+) -> Sale:
     return Sale(
         source="test",
-        external_id="1",
+        external_id=external_id,
         title="Test sale",
-        url="https://example.test/sale/1",
+        url=f"https://example.test/sale/{external_id}",
         organization_name=None,
         address=None,
         latitude=43,
@@ -34,7 +41,7 @@ def _sale(pictures: int = 5, modified: datetime | None = None) -> Sale:
         sale_type="EstateSales",
         picture_count=pictures,
         first_start_at=datetime(2026, 7, 1, tzinfo=UTC),
-        last_end_at=datetime(2026, 7, 2, tzinfo=UTC),
+        last_end_at=last_end_at or datetime(2026, 7, 2, tzinfo=UTC),
         first_published_at=None,
         remote_modified_at=modified,
         latest_pictures_added_count=0,
@@ -62,6 +69,39 @@ def test_image_deduplication() -> None:
     assert image1.id == image2.id
     assert new1 is True
     assert new2 is False
+
+
+def test_active_only_analysis_ignores_stale_active_flag_for_ended_sales() -> None:
+    session = _session()
+    repo = Repository(session)
+    now = utc_now()
+    ended_sale, _, _ = repo.upsert_sale(
+        _sale(external_id="ended", last_end_at=now - timedelta(days=7))
+    )
+    future_sale, _, _ = repo.upsert_sale(
+        _sale(external_id="future", last_end_at=now + timedelta(days=7))
+    )
+    ended_sale.active = True
+    ended_image, _ = repo.upsert_image(
+        ended_sale, SalePicture(None, "https://example.test/ended.jpg")
+    )
+    future_image, _ = repo.upsert_image(
+        future_sale, SalePicture(None, "https://example.test/future.jpg")
+    )
+    for image in [ended_image, future_image]:
+        image.status = "analyzed"
+        image.analyzed_at = now - timedelta(days=1)
+        image.analysis_version = "old-version"
+    session.flush()
+
+    images = repo.images_to_analyze(
+        analysis_version="new-version",
+        reanalyze=False,
+        version_mismatch=True,
+        active_only=True,
+    )
+
+    assert images == [future_image]
 
 
 def test_detection_persistence_and_email_status() -> None:
