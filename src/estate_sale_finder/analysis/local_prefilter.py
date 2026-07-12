@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import logging
 from pathlib import Path
 
@@ -71,6 +72,20 @@ NEGATIVE_CONCEPTS = [
 ]
 
 
+def assert_open_clip_available() -> None:
+    missing: list[str] = []
+    for module_name in ["torch", "open_clip"]:
+        try:
+            importlib.import_module(module_name)
+        except ImportError as exc:
+            missing.append(f"{module_name}: {exc}")
+    if missing:
+        raise RuntimeError(
+            "LOCAL_PREFILTER_ENABLED=true requires the Docker image or environment "
+            "to include the prefilter dependencies: " + "; ".join(missing)
+        )
+
+
 class DisabledPrefilter:
     def score(self, image_path: Path) -> tuple[bool, float]:
         return True, 1.0
@@ -81,14 +96,18 @@ class OpenClipPrefilter:
         self.model_name = model_name
         self.threshold = threshold
         self._loaded = False
+        self._unavailable_error: str | None = None
 
     def score(self, image_path: Path) -> tuple[bool, float]:
+        if self._unavailable_error is not None:
+            return True, 1.0
         # The optional open-clip-torch dependency is intentionally loaded lazily so normal
         # deployments can leave LOCAL_PREFILTER_ENABLED=false without carrying a heavy model.
         try:
             score = self._score_with_open_clip(image_path)
         except Exception as exc:
-            logger.warning("local_prefilter_unavailable", extra={"error": str(exc)})
+            self._unavailable_error = str(exc)
+            logger.warning("local_prefilter_unavailable", extra={"error": self._unavailable_error})
             return True, 1.0
         return score >= self.threshold, score
 

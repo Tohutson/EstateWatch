@@ -156,7 +156,7 @@ The process lock prevents overlapping runs. If a previous process was interrupte
 
 ## Local Prefilter
 
-`LOCAL_PREFILTER_ENABLED=false` by default. When enabled with the optional `prefilter` dependency, the app lazily loads `open-clip-torch` and caches model files under `XDG_CACHE_HOME` (`/app/model-cache` in Docker). The threshold is recall-oriented and must be tuned with saved scores in the database.
+`LOCAL_PREFILTER_ENABLED=false` by default. The production Docker image includes the `prefilter` dependency set (`torch` and `open-clip-torch`) so the prefilter can run on the home server when enabled. The app lazily loads the model and caches model files under `XDG_CACHE_HOME` (`/app/model-cache` in Docker). The threshold is recall-oriented and must be tuned with saved scores in the database.
 
 Each run logs `local_prefilter_complete` with `images_prefiltered`, `images_prefilter_passed`, and `images_prefilter_rejected`. The final `run_complete` log includes those counters plus `vision_batches_sent`, `vision_batches_succeeded`, `vision_batches_failed`, `vision_batches_attempted`, `vision_batches_retried`, `vision_batch_mapping_failures`, `images_retried_individually`, `images_analysis_succeeded`, and `images_analysis_failed`.
 
@@ -330,7 +330,7 @@ docker compose run --rm scanner doctor
 - Watchlist validation fails: run `estate-sale-finder watchlists validate`; watchlist IDs must be unique, recipients must look like email addresses, targets must be in the approved category list, and active watchlists need recipients when email is enabled.
 - No email: verify `EMAIL_ENABLED=true`, shared SMTP settings, watchlist recipients, and server outbound SMTP policy.
 - Repeated detections: inspect `detection_notifications`; failed SMTP sends intentionally leave that watchlist recipient's detections unsent.
-- Slow first prefilter run: model weights are downloading to `model-cache`.
+- Slow first prefilter run: model weights are downloading to `model-cache`. Make sure `/opt/estate-sale-finder/model-cache` is writable by the container user, or create it with permissive ownership before the first run.
 
 ## Watchlist Migration Steps
 

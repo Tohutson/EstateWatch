@@ -18,7 +18,7 @@ COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 COPY alembic ./alembic
 COPY alembic.ini ./
-RUN uv sync --frozen --no-dev --no-cache \
+RUN uv sync --frozen --no-dev --extra prefilter --no-cache \
     && mkdir -p /app/data /app/model-cache \
     && chown -R appuser:appuser /app/data /app/model-cache
 
