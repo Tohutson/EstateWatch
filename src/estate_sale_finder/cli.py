@@ -7,7 +7,11 @@ from pathlib import Path
 from sqlalchemy import text
 
 from estate_sale_finder.analysis.base import LocalPrefilter, VisionProvider
-from estate_sale_finder.analysis.local_prefilter import DisabledPrefilter, OpenClipPrefilter
+from estate_sale_finder.analysis.local_prefilter import (
+    DisabledPrefilter,
+    OpenClipPrefilter,
+    assert_open_clip_available,
+)
 from estate_sale_finder.analysis.mock import MockVisionProvider
 from estate_sale_finder.analysis.openai_vision import OpenAIVisionProvider
 from estate_sale_finder.config import Settings, get_settings
@@ -142,6 +146,8 @@ def doctor(settings: Settings) -> int:
     location = source.resolve_postal_code(settings.postal_code)
     if settings.analysis_provider == "openai" and not settings.vision_api_key:
         raise RuntimeError("OpenAI vision provider is selected but VISION_API_KEY is missing")
+    if settings.local_prefilter_enabled:
+        assert_open_clip_available()
     load_watchlists(
         settings,
         require_recipients=bool(settings.watchlist_config_path) or settings.email_enabled,
