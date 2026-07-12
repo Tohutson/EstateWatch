@@ -18,6 +18,20 @@ POSITIVE_CONCEPTS = [
     "golf putter",
     "golf bag",
     "golf balls",
+    "large collectible perfume bottle",
+    "ornate perfume bottle",
+    "vintage perfume bottle",
+    "display perfume bottle",
+    "collection of perfume bottles",
+    "jewelry",
+    "rings",
+    "necklaces",
+    "bracelets",
+    "earrings",
+    "brooches",
+    "pendants",
+    "jewelry lot",
+    "watch as jewelry",
 ]
 
 NEGATIVE_CONCEPTS = [
@@ -39,6 +53,21 @@ NEGATIVE_CONCEPTS = [
     "decorative golf item",
     "empty product packaging",
     "ordinary household objects",
+    "toiletries",
+    "shampoo bottle",
+    "lotion bottle",
+    "medicine bottle",
+    "cleaning bottle",
+    "generic glass bottle",
+    "alcohol bottle",
+    "perfume box without bottle",
+    "jewelry box without jewelry",
+    "keys",
+    "coins",
+    "silverware",
+    "metal hardware",
+    "clothing decoration",
+    "beads not made into jewelry",
 ]
 
 

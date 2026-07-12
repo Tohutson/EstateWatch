@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from sqlalchemy import Select, delete, select
+from sqlalchemy import Select, delete, exists, select
 from sqlalchemy.orm import Session, selectinload
 
 from estate_sale_finder.domain.models import (
     APPROVED_TARGET_CATEGORIES,
+    DEFAULT_TARGET_CATEGORIES,
     DetectedItem,
     ImageAnalysisResult,
     Sale,
@@ -13,8 +14,17 @@ from estate_sale_finder.domain.models import (
 )
 from estate_sale_finder.utils.dates import utc_now
 from estate_sale_finder.utils.urls import normalize_url
+from estate_sale_finder.watchlists import LEGACY_WATCHLIST_ID, WatchlistProfile
 
-from .models import DetectionORM, ImageORM, RunORM, SaleORM
+from .models import (
+    DetectionNotificationORM,
+    DetectionORM,
+    ImageORM,
+    RunORM,
+    SaleORM,
+    WatchlistORM,
+    WatchlistTargetORM,
+)
 
 
 def sale_has_changed(existing: SaleORM, sale: Sale) -> bool:
@@ -164,6 +174,7 @@ class Repository:
         reanalyze: bool,
         version_mismatch: bool,
         sale_db_id: int | None = None,
+        active_only: bool = False,
     ) -> list[ImageORM]:
         if reanalyze or version_mismatch:
             stmt: Select[tuple[ImageORM]] = select(ImageORM).where(
@@ -173,6 +184,8 @@ class Repository:
             stmt = select(ImageORM).where(ImageORM.status.in_(["downloaded", "failed"]))
         if sale_db_id is not None:
             stmt = stmt.where(ImageORM.sale_id == sale_db_id)
+        if active_only:
+            stmt = stmt.join(ImageORM.sale).where(SaleORM.active.is_(True))
         if not reanalyze:
             if version_mismatch:
                 stmt = stmt.where(
@@ -194,6 +207,126 @@ class Repository:
                 .limit(limit)
             )
         )
+
+    def sync_watchlists(self, profiles: list[WatchlistProfile]) -> None:
+        now = utc_now()
+        active_ids = {profile.id for profile in profiles}
+        for existing in self.session.scalars(select(WatchlistORM)):
+            if existing.id not in active_ids:
+                existing.active = False
+                existing.updated_at = now
+        for profile in profiles:
+            watchlist = self.session.get(WatchlistORM, profile.id)
+            if watchlist is None:
+                watchlist = WatchlistORM(
+                    id=profile.id,
+                    name=profile.name,
+                    config_hash=profile.config_hash,
+                    created_at=now,
+                    updated_at=now,
+                    active=profile.active,
+                )
+                self.session.add(watchlist)
+            else:
+                watchlist.name = profile.name
+                watchlist.config_hash = profile.config_hash
+                watchlist.updated_at = now
+                watchlist.active = profile.active
+        if active_ids:
+            self.session.flush()
+            self.session.execute(
+                delete(WatchlistTargetORM).where(WatchlistTargetORM.watchlist_id.in_(active_ids))
+            )
+            self.session.flush()
+        for profile in profiles:
+            for category in sorted(profile.targets):
+                self.session.add(WatchlistTargetORM(watchlist_id=profile.id, category=category))
+        self.session.flush()
+
+    def seed_legacy_notification_state(self, profiles: list[WatchlistProfile]) -> int:
+        seeded = 0
+        legacy_profiles = [
+            profile
+            for profile in profiles
+            if profile.id == LEGACY_WATCHLIST_ID and profile.recipients
+        ]
+        if not legacy_profiles:
+            return 0
+        for profile in legacy_profiles:
+            legacy_targets = DEFAULT_TARGET_CATEGORIES & profile.targets
+            if not legacy_targets:
+                continue
+            detections = list(
+                self.session.scalars(
+                    select(DetectionORM)
+                    .where(DetectionORM.included_in_email.is_(True))
+                    .where(DetectionORM.category.in_(legacy_targets))
+                )
+            )
+            for detection in detections:
+                for recipient in profile.recipients:
+                    if self._notification_exists(detection.id, profile.id, recipient):
+                        continue
+                    self.session.add(
+                        DetectionNotificationORM(
+                            detection_id=detection.id,
+                            watchlist_id=profile.id,
+                            recipient_email=recipient,
+                            sent_at=detection.email_sent_at or detection.created_at,
+                            email_run_id=None,
+                        )
+                    )
+                    seeded += 1
+        self.session.flush()
+        return seeded
+
+    def pending_detections_for_watchlist(
+        self,
+        profile: WatchlistProfile,
+        recipient: str,
+        *,
+        limit: int,
+    ) -> list[DetectionORM]:
+        return list(
+            self.session.scalars(
+                select(DetectionORM)
+                .options(selectinload(DetectionORM.image).selectinload(ImageORM.sale))
+                .where(DetectionORM.category.in_(profile.targets))
+                .where(DetectionORM.category.in_(APPROVED_TARGET_CATEGORIES))
+                .where(
+                    ~exists().where(
+                        (DetectionNotificationORM.detection_id == DetectionORM.id)
+                        & (DetectionNotificationORM.watchlist_id == profile.id)
+                        & (DetectionNotificationORM.recipient_email == recipient)
+                    )
+                )
+                .order_by(DetectionORM.created_at.asc())
+                .limit(limit)
+            )
+        )
+
+    def mark_notifications_sent(
+        self,
+        detections: list[DetectionORM],
+        *,
+        watchlist_id: str,
+        recipient: str,
+        email_run_id: int | None,
+    ) -> None:
+        now = utc_now()
+        for detection in detections:
+            if self._notification_exists(detection.id, watchlist_id, recipient):
+                continue
+            self.session.add(
+                DetectionNotificationORM(
+                    detection_id=detection.id,
+                    watchlist_id=watchlist_id,
+                    recipient_email=recipient,
+                    sent_at=now,
+                    email_run_id=email_run_id,
+                )
+            )
+        self.session.flush()
 
     def persist_analysis(
         self,
@@ -235,6 +368,22 @@ class Repository:
         for detection in detections:
             detection.included_in_email = True
             detection.email_sent_at = now
+
+    def _notification_exists(
+        self,
+        detection_id: int,
+        watchlist_id: str,
+        recipient: str,
+    ) -> bool:
+        return (
+            self.session.scalar(
+                select(DetectionNotificationORM.id)
+                .where(DetectionNotificationORM.detection_id == detection_id)
+                .where(DetectionNotificationORM.watchlist_id == watchlist_id)
+                .where(DetectionNotificationORM.recipient_email == recipient)
+            )
+            is not None
+        )
 
 
 def _detection_from_item(

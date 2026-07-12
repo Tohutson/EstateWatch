@@ -15,9 +15,9 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 from estate_sale_finder.analysis.base import AnalysisImage
 from estate_sale_finder.analysis.errors import VisionProviderError, VisionResponseParseError
 from estate_sale_finder.analysis.prompts import (
-    VISION_RESPONSE_SCHEMA,
-    VISION_SYSTEM_PROMPT,
-    VISION_USER_PROMPT,
+    build_response_schema,
+    build_system_prompt,
+    build_user_prompt,
 )
 from estate_sale_finder.config import Settings
 from estate_sale_finder.domain.models import (
@@ -64,11 +64,17 @@ class VisionBatchResponse(BaseModel):
 class OpenAIVisionProvider:
     provider_name = "openai"
 
-    def __init__(self, settings: Settings, client: httpx.Client | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        client: httpx.Client | None = None,
+        target_categories: set[str] | frozenset[str] = APPROVED_TARGET_CATEGORIES,
+    ):
         if not settings.vision_api_key:
             raise ValueError("VISION_API_KEY is required for OpenAI vision provider")
         self.settings = settings
         self.model_name = settings.vision_model
+        self.target_categories = frozenset(target_categories)
         self.client = client or httpx.Client(
             base_url="https://api.openai.com/v1",
             timeout=settings.http_timeout_seconds,
@@ -223,7 +229,9 @@ class OpenAIVisionProvider:
         )
 
     def _request_payload(self, images: list[AnalysisImage]) -> dict[str, Any]:
-        content: list[dict[str, Any]] = [{"type": "input_text", "text": VISION_USER_PROMPT}]
+        content: list[dict[str, Any]] = [
+            {"type": "input_text", "text": build_user_prompt(self.target_categories)}
+        ]
         for image in images:
             content.append(
                 {
@@ -244,14 +252,14 @@ class OpenAIVisionProvider:
         return {
             "model": self.model_name,
             "store": False,
-            "instructions": VISION_SYSTEM_PROMPT,
+            "instructions": build_system_prompt(self.target_categories),
             "input": [{"role": "user", "content": content}],
             "text": {
                 "format": {
                     "type": "json_schema",
                     "name": "estate_sale_image_results",
                     "strict": True,
-                    "schema": VISION_RESPONSE_SCHEMA,
+                    "schema": build_response_schema(self.target_categories),
                 }
             },
         }

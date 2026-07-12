@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -11,7 +10,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from estate_sale_finder.analysis.base import AnalysisImage
 from estate_sale_finder.analysis.errors import VisionProviderError
 from estate_sale_finder.config import Settings
-from estate_sale_finder.db.models import Base, DetectionORM, ImageORM, RunORM
+from estate_sale_finder.db.models import (
+    Base,
+    DetectionNotificationORM,
+    DetectionORM,
+    ImageORM,
+    RunORM,
+)
 from estate_sale_finder.domain.models import (
     DetectedItem,
     ImageAnalysisResult,
@@ -21,6 +26,7 @@ from estate_sale_finder.domain.models import (
     SalePicture,
 )
 from estate_sale_finder.pipeline import Pipeline, RunOptions
+from estate_sale_finder.watchlists import WatchlistProfile
 
 
 class FakeSource:
@@ -30,6 +36,7 @@ class FakeSource:
         self.picture_count = picture_count
         self.picture_urls = picture_urls or ["https://example.test/match-1.jpg"]
         self.remote_modified_at = datetime(2026, 6, 20, tzinfo=UTC)
+        self.last_end_at = datetime(2026, 7, 2, tzinfo=UTC)
         self.gallery_calls = 0
 
     def resolve_postal_code(self, postal_code: str) -> PostalCodeLocation:
@@ -47,7 +54,7 @@ class FakeSource:
                 postal_code="14221",
                 sale_type="EstateSales",
                 first_start_at=datetime(2026, 7, 1, tzinfo=UTC),
-                last_end_at=datetime(2026, 7, 2, tzinfo=UTC),
+                last_end_at=self.last_end_at,
             )
         ]
 
@@ -68,7 +75,7 @@ class FakeSource:
                 sale_type="EstateSales",
                 picture_count=self.picture_count,
                 first_start_at=datetime(2026, 7, 1, tzinfo=UTC),
-                last_end_at=datetime(2026, 7, 2, tzinfo=UTC),
+                last_end_at=self.last_end_at,
                 first_published_at=None,
                 remote_modified_at=self.remote_modified_at,
                 latest_pictures_added_count=len(self.picture_urls),
@@ -96,6 +103,16 @@ class FakeDownloader:
         image.mime_type = "image/jpeg"
 
 
+class FailingDownloader:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def download_into_record(self, image: ImageORM) -> None:
+        self.calls += 1
+        image.status = "error"
+        image.error_message = "temporary CDN connection failure"
+
+
 class FakeVision:
     provider_name = "fake"
     model_name = "fake-model"
@@ -110,6 +127,31 @@ class FakeVision:
                 image_ref=image.image_ref,
                 contains_target=True,
                 items=[DetectedItem("modern_camera", "digital camera", 0.9, 0.8, None, "match")],
+                provider="fake",
+                model_name="fake-model",
+                prompt_version="test",
+            )
+            for image in images
+        ]
+
+
+class MultiTargetVision:
+    provider_name = "fake"
+    model_name = "fake-model"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def analyze(self, images: list[AnalysisImage]) -> list[ImageAnalysisResult]:
+        self.calls += len(images)
+        return [
+            ImageAnalysisResult(
+                image_ref=image.image_ref,
+                contains_target=True,
+                items=[
+                    DetectedItem("golf_bag", "golf bag", 0.9, 0.0, None, "visible bag"),
+                    DetectedItem("jewelry", "rings", 0.9, 0.0, None, "visible rings"),
+                ],
                 provider="fake",
                 model_name="fake-model",
                 prompt_version="test",
@@ -249,14 +291,28 @@ class FakePrefilter:
 
 
 class FakeNotifier:
-    def __init__(self, fail: bool = False) -> None:
+    def __init__(
+        self,
+        fail: bool = False,
+        fail_recipients: set[str] | None = None,
+    ) -> None:
         self.sent = 0
+        self.messages: list[tuple[str, str, list[str]]] = []
         self.fail = fail
+        self.fail_recipients = fail_recipients or set()
 
-    def send_digest(self, detections: list[DetectionORM]) -> None:
-        if self.fail:
+    def send_digest(
+        self,
+        profile: WatchlistProfile,
+        recipient: str,
+        detections: list[DetectionORM],
+    ) -> None:
+        if self.fail or recipient in self.fail_recipients:
             raise RuntimeError("smtp failed")
         self.sent += len(detections)
+        self.messages.append(
+            (profile.id, recipient, [detection.category for detection in detections])
+        )
 
     def send_failure(self, subject: str, body: str) -> None:
         return None
@@ -276,6 +332,7 @@ def _settings(tmp_path: Path, *, email: bool = True, version: str = "v1") -> Set
         email_from="from@example.test" if email else None,
         email_to="to@example.test" if email else "",
         analysis_version=version,
+        watchlist_config_path=None,
     )
 
 
@@ -399,11 +456,11 @@ def test_failed_email_does_not_mark_sent(tmp_path: Path) -> None:
         vision_provider=FakeVision(),
         notifier=FakeNotifier(fail=True),
     )
-    with suppress(RuntimeError):
-        pipeline.run(RunOptions())
+    pipeline.run(RunOptions())
     detections = list(session.scalars(select(DetectionORM)))
     assert detections
     assert detections[0].included_in_email is False
+    assert list(session.scalars(select(DetectionNotificationORM))) == []
 
 
 def test_analysis_version_change_reanalyzes_when_requested(tmp_path: Path) -> None:
@@ -597,6 +654,34 @@ def test_failed_image_is_retryable_without_duplicate_prior_successes(tmp_path: P
     assert len(list(session.scalars(select(DetectionORM)))) == 1
 
 
+def test_failed_download_is_retryable_on_next_run(tmp_path: Path) -> None:
+    session = _session()
+    failing_downloader = FailingDownloader()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=FakeSource(picture_urls=["https://example.test/image-1.jpg"]),
+        downloader=failing_downloader,  # type: ignore[arg-type]
+        vision_provider=FakeVision(),
+    )
+
+    first = pipeline.run(RunOptions())
+    image = session.scalar(select(ImageORM))
+
+    assert first.images_downloaded == 0
+    assert image is not None
+    assert image.status == "error"
+    assert image.downloaded_at is None
+
+    pipeline.downloader = FakeDownloader(tmp_path)  # type: ignore[assignment]
+    second = pipeline.run(RunOptions())
+
+    assert failing_downloader.calls == 1
+    assert second.images_downloaded == 1
+    assert second.images_analyzed == 1
+    assert image.status == "analyzed"
+
+
 def test_vision_max_images_per_run_limits_analysis(tmp_path: Path) -> None:
     session = _session()
     vision = FakeVision()
@@ -641,3 +726,105 @@ def test_stale_running_runs_are_marked_failed(tmp_path: Path) -> None:
     assert stale.status == "failed"
     assert stale.completion_time is not None
     assert stale.error_summary is not None
+
+
+def test_one_scan_routes_multiple_watchlists_without_duplicate_analysis(tmp_path: Path) -> None:
+    session = _session()
+    source = FakeSource()
+    vision = MultiTargetVision()
+    notifier = FakeNotifier()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=vision,
+        notifier=notifier,
+        watchlists=_watchlists(),
+    )
+
+    first = pipeline.run(RunOptions())
+    second = pipeline.run(RunOptions())
+
+    assert first.images_analyzed == 1
+    assert second.images_analyzed == 0
+    assert vision.calls == 1
+    assert notifier.messages == [
+        ("golf_camera", "golf@example.test", ["golf_bag"]),
+        ("perfume_jewelry", "jewelry@example.test", ["jewelry"]),
+    ]
+    assert notifier.sent == 2
+
+
+def test_failed_email_for_one_recipient_does_not_mark_another(tmp_path: Path) -> None:
+    session = _session()
+    notifier = FakeNotifier(fail_recipients={"jewelry@example.test"})
+    pipeline = Pipeline(
+        settings=_settings(tmp_path),
+        session=session,
+        source=FakeSource(),
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=MultiTargetVision(),
+        notifier=notifier,
+        watchlists=_watchlists(),
+    )
+
+    summary = pipeline.run(RunOptions())
+    notifications = list(session.scalars(select(DetectionNotificationORM)))
+
+    assert summary.email_status == "partial_failed"
+    assert [(row.watchlist_id, row.recipient_email) for row in notifications] == [
+        ("golf_camera", "golf@example.test")
+    ]
+
+
+def test_backfill_active_can_evaluate_existing_images_for_new_categories(tmp_path: Path) -> None:
+    session = _session()
+    source = FakeSource()
+    vision = FakeVision()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False, version="golf-camera-v2"),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=vision,
+        watchlists=[_watchlists()[0]],
+    )
+    pipeline.run(RunOptions())
+    pipeline.settings.analysis_version = "multi-watchlist-v1"
+    pipeline.vision_provider = MultiTargetVision()
+    pipeline.watchlists = _watchlists()
+    source.last_end_at = datetime(2026, 8, 1, tzinfo=UTC)
+
+    summary = pipeline.run(RunOptions(reanalyze_version_mismatch=True, active_only=True))
+
+    assert summary.images_analyzed == 1
+    assert {detection.category for detection in session.scalars(select(DetectionORM))} == {
+        "golf_bag",
+        "jewelry",
+    }
+
+
+def _watchlists() -> list[WatchlistProfile]:
+    return [
+        WatchlistProfile(
+            id="golf_camera",
+            name="Golf and Camera Finds",
+            recipients=("golf@example.test",),
+            targets=frozenset(
+                {
+                    "golf_clubs",
+                    "golf_bag",
+                    "golf_balls",
+                    "modern_camera",
+                    "modern_camera_lens",
+                }
+            ),
+        ),
+        WatchlistProfile(
+            id="perfume_jewelry",
+            name="Perfume and Jewelry Finds",
+            recipients=("jewelry@example.test",),
+            targets=frozenset({"collectible_perfume_bottle", "jewelry"}),
+        ),
+    ]

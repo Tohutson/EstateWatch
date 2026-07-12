@@ -26,6 +26,7 @@ from estate_sale_finder.notifications.base import NotificationProvider
 from estate_sale_finder.sources.base import GalleryUnavailableError, SaleSource
 from estate_sale_finder.utils.dates import overlaps_window, utc_now
 from estate_sale_finder.utils.geo import haversine_miles
+from estate_sale_finder.watchlists import WatchlistProfile, load_watchlists
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +37,16 @@ class RunOptions:
     reanalyze_version_mismatch: bool = False
     sale_id: str | None = None
     dry_run: bool = False
+    active_only: bool = False
 
 
 class NoopNotifier:
-    def send_digest(self, detections: list[DetectionORM]) -> None:
+    def send_digest(
+        self,
+        profile: WatchlistProfile,
+        recipient: str,
+        detections: list[DetectionORM],
+    ) -> None:
         return None
 
     def send_failure(self, subject: str, body: str) -> None:
@@ -57,6 +64,7 @@ class Pipeline:
         vision_provider: VisionProvider,
         notifier: NotificationProvider | None = None,
         prefilter: LocalPrefilter | None = None,
+        watchlists: list[WatchlistProfile] | None = None,
     ):
         self.settings = settings
         self.session = session
@@ -66,6 +74,10 @@ class Pipeline:
         self.vision_provider = vision_provider
         self.notifier = notifier or NoopNotifier()
         self.prefilter = prefilter or DisabledPrefilter()
+        self.watchlists = watchlists or load_watchlists(
+            settings,
+            require_recipients=settings.email_enabled,
+        )
 
     def run(self, options: RunOptions) -> RunSummary:
         abandoned_runs = self.repo.mark_abandoned_running_runs()
@@ -75,6 +87,11 @@ class Pipeline:
         run = self.repo.create_run()
         summary = RunSummary()
         try:
+            self.repo.sync_watchlists(self.watchlists)
+            seeded = self.repo.seed_legacy_notification_state(self.watchlists)
+            if seeded:
+                logger.info("legacy_notification_state_seeded", extra={"count": seeded})
+            self.session.commit()
             if options.sale_id:
                 sales = self.source.hydrate_sales([options.sale_id])
                 candidates_by_id: dict[str, SaleCandidate] = {}
@@ -94,7 +111,7 @@ class Pipeline:
             self._refresh_galleries(sales_to_refresh, summary)
             self._download_discovered_images(summary)
             self._analyze_images(options, summary)
-            self._send_digest(summary, options)
+            self._send_digest(summary, options, run.id)
             self.repo.finish_run(run, status="success", summary=summary)
             self.session.commit()
             logger.info("run_complete", extra=summary.__dict__)
@@ -105,7 +122,13 @@ class Pipeline:
                 run = self.session.merge(run)
                 self.repo.finish_run(run, status="failed", summary=summary, error_summary=str(exc))
             if self.settings.email_send_on_failure and not options.dry_run:
-                self.notifier.send_failure("Estate Sale Finder failed", str(exc))
+                try:
+                    self.notifier.send_failure("Estate Sale Finder failed", str(exc))
+                except Exception as notify_exc:
+                    logger.warning(
+                        "failure_notification_failed",
+                        extra={"error": _sanitize_error(str(notify_exc))},
+                    )
             logger.exception("run_failed")
             raise
 
@@ -190,7 +213,14 @@ class Pipeline:
             self.session.commit()
 
     def _download_discovered_images(self, summary: RunSummary) -> None:
-        images = list(self.session.scalars(select(ImageORM).where(ImageORM.status == "discovered")))
+        images = list(
+            self.session.scalars(
+                select(ImageORM).where(
+                    (ImageORM.status == "discovered")
+                    | ((ImageORM.status == "error") & (ImageORM.downloaded_at.is_(None)))
+                )
+            )
+        )
         for image in images:
             self.downloader.download_into_record(image)
             if image.status == "downloaded":
@@ -207,6 +237,7 @@ class Pipeline:
             reanalyze=options.reanalyze,
             version_mismatch=options.reanalyze_version_mismatch,
             sale_db_id=sale_db_id,
+            active_only=options.active_only,
         )
         if self.settings.vision_max_images_per_run is not None:
             original_count = len(images)
@@ -450,20 +481,57 @@ class Pipeline:
             "sale_ids": sale_ids,
         }
 
-    def _send_digest(self, summary: RunSummary, options: RunOptions) -> None:
-        detections = self.repo.unemailable_detections(limit=50)
+    def _send_digest(self, summary: RunSummary, options: RunOptions, run_id: int) -> None:
         if options.dry_run:
             summary.email_status = "dry_run"
-            return
-        if not detections and not self.settings.email_send_on_no_matches:
-            summary.email_status = "no_matches"
             return
         if not self.settings.email_enabled:
             summary.email_status = "disabled"
             return
-        self.notifier.send_digest(detections)
-        self.repo.mark_detections_emailed(detections)
-        summary.email_status = "sent"
+        sent = 0
+        failures = 0
+        considered = 0
+        for profile in self.watchlists:
+            for recipient in profile.recipients:
+                considered += 1
+                detections = self.repo.pending_detections_for_watchlist(
+                    profile,
+                    recipient,
+                    limit=50,
+                )
+                if not detections and not profile.send_on_no_matches:
+                    continue
+                try:
+                    self.notifier.send_digest(profile, recipient, detections)
+                except Exception as exc:
+                    failures += 1
+                    logger.warning(
+                        "watchlist_email_failed",
+                        extra={
+                            "watchlist_id": profile.id,
+                            "recipient_hash": _recipient_hash(recipient),
+                            "error": _sanitize_error(str(exc)),
+                        },
+                    )
+                    continue
+                self.repo.mark_notifications_sent(
+                    detections,
+                    watchlist_id=profile.id,
+                    recipient=recipient,
+                    email_run_id=run_id,
+                )
+                sent += 1
+                self.session.commit()
+        if failures and sent:
+            summary.email_status = "partial_failed"
+        elif failures:
+            summary.email_status = "failed"
+        elif sent:
+            summary.email_status = "sent"
+        elif considered:
+            summary.email_status = "no_matches"
+        else:
+            summary.email_status = "no_recipients"
 
 
 def _with_batch_refs(batch: list[AnalysisImage]) -> list[AnalysisImage]:
@@ -485,3 +553,9 @@ def _sanitize_error(error: str, limit: int = 500) -> str:
     if len(sanitized) <= limit:
         return sanitized
     return sanitized[: limit - 3] + "..."
+
+
+def _recipient_hash(recipient: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(recipient.lower().encode("utf-8")).hexdigest()[:12]
