@@ -41,6 +41,17 @@ def test_vision_retry_settings_are_bounded(tmp_path: Path) -> None:
         Settings(_env_file=None, data_dir=tmp_path, vision_max_single_image_attempts=0)
 
 
+def test_sale_window_settings_are_validated(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    assert settings.sale_window_mode == "upcoming_weekend"
+    assert settings.sale_timezone == "America/New_York"
+
+    with pytest.raises(ValueError, match="Unknown SALE_TIMEZONE"):
+        Settings(_env_file=None, data_dir=tmp_path, sale_timezone="Not/A_Timezone")
+    with pytest.raises(ValueError, match="LOOKAHEAD_DAYS"):
+        Settings(_env_file=None, data_dir=tmp_path, lookahead_days=0)
+
+
 def test_valid_two_watchlist_config_loads(tmp_path: Path) -> None:
     path = _write_watchlists(tmp_path)
     settings = Settings(_env_file=None, data_dir=tmp_path, watchlist_config_path=path)

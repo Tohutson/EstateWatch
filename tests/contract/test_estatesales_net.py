@@ -108,6 +108,23 @@ def test_discover_and_hydrate_sales(tmp_path: Path) -> None:
 
 
 @respx.mock
+def test_hydration_ignores_unrequested_sale_ids_from_fixture(tmp_path: Path) -> None:
+    fixture_path = Path(__file__).parents[1] / "fixtures" / "sale_details_hydration_with_extra.json"
+    settings = Settings(data_dir=tmp_path, estatesales_base_url="https://example.test")
+    respx.get("https://example.test/api/sale-details").mock(
+        return_value=httpx.Response(
+            200,
+            content=fixture_path.read_bytes(),
+            headers={"content-type": "application/json"},
+        )
+    )
+
+    sales = EstateSalesNetClient(settings).hydrate_sales(["1"])
+
+    assert [sale.external_id for sale in sales] == ["1"]
+
+
+@respx.mock
 def test_gallery_unavailable(tmp_path: Path) -> None:
     settings = Settings(data_dir=tmp_path, estatesales_base_url="https://example.test")
     client = EstateSalesNetClient(settings)

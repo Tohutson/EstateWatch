@@ -146,7 +146,16 @@ class EstateSalesNetClient:
             )
             if not isinstance(payload, list):
                 raise ValueError("Sale hydration response was not a list")
-            hydrated.extend(self._sale_from_payload(item) for item in payload)
+            requested_ids = set(batch)
+            for item in payload:
+                external_id = str(item.get("id"))
+                if external_id not in requested_ids:
+                    logger.warning(
+                        "sale_hydration_unexpected_id",
+                        extra={"sale_external_id": external_id},
+                    )
+                    continue
+                hydrated.append(self._sale_from_payload(item))
         return hydrated
 
     def get_sale_pictures(self, sale: Sale) -> list[SalePicture]:

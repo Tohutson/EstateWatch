@@ -104,6 +104,31 @@ def test_active_only_analysis_ignores_stale_active_flag_for_ended_sales() -> Non
     assert images == [future_image]
 
 
+def test_analysis_can_be_scoped_to_selected_sales() -> None:
+    session = _session()
+    repo = Repository(session)
+    selected_sale, _, _ = repo.upsert_sale(_sale(external_id="selected"))
+    stale_sale, _, _ = repo.upsert_sale(_sale(external_id="stale"))
+    selected_image, _ = repo.upsert_image(
+        selected_sale, SalePicture(None, "https://example.test/selected.jpg")
+    )
+    stale_image, _ = repo.upsert_image(
+        stale_sale, SalePicture(None, "https://example.test/stale.jpg")
+    )
+    for image in [selected_image, stale_image]:
+        image.status = "downloaded"
+    session.flush()
+
+    images = repo.images_to_analyze(
+        analysis_version="v1",
+        reanalyze=False,
+        version_mismatch=False,
+        sale_db_ids={selected_sale.id},
+    )
+
+    assert images == [selected_image]
+
+
 def test_detection_persistence_and_email_status() -> None:
     session = _session()
     repo = Repository(session)

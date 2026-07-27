@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import cached_property
 from pathlib import Path
 from typing import Annotated, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -28,6 +29,8 @@ class Settings(BaseSettings):
     database_url: str | None = None
     postal_code: str = "14221"
     search_radius_miles: float = 35.0
+    sale_window_mode: Literal["upcoming_weekend", "rolling"] = "upcoming_weekend"
+    sale_timezone: str = "America/New_York"
     lookahead_days: int = 15
     min_picture_count: int = 5
     allowed_sale_types: Annotated[list[str], NoDecode] = Field(
@@ -88,6 +91,15 @@ class Settings(BaseSettings):
     def expand_watchlist_config_path(cls, value: Path | None) -> Path | None:
         return value.expanduser() if value else None
 
+    @field_validator("sale_timezone")
+    @classmethod
+    def validate_sale_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Unknown SALE_TIMEZONE: {value}") from exc
+        return value
+
     @model_validator(mode="after")
     def validate_feature_settings(self) -> Settings:
         if self.analysis_provider == "openai" and not self.vision_api_key:
@@ -106,6 +118,8 @@ class Settings(BaseSettings):
             )
         if self.vision_retry_backoff_seconds < 0 or self.vision_retry_backoff_seconds > 300:
             raise ValueError("VISION_RETRY_BACKOFF_SECONDS must be between 0 and 300")
+        if self.lookahead_days < 1 or self.lookahead_days > 365:
+            raise ValueError("LOOKAHEAD_DAYS must be between 1 and 365")
         if self.email_enabled:
             missing = [
                 name
