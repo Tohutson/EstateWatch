@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "name": "Requested sale",
+    "latitude": 43.0,
+    "longitude": -78.7,
+    "cityName": "Buffalo",
+    "stateCode": "NY",
+    "postalCodeNumber": "14221",
+    "type": 1,
+    "pictureCount": 6,
+    "dates": [],
+    "firstUtcStartDate": {
+      "_type": "DateTime",
+      "_value": "2026-07-31T13:00:00Z"
+    },
+    "lastUtcEndDate": {
+      "_type": "DateTime",
+      "_value": "2026-08-02T20:00:00Z"
+    }
+  },
+  {
+    "id": 999,
+    "name": "Unexpected old sale",
+    "latitude": 43.0,
+    "longitude": -78.7,
+    "cityName": "Buffalo",
+    "stateCode": "NY",
+    "postalCodeNumber": "14221",
+    "type": 1,
+    "pictureCount": 20,
+    "dates": [],
+    "firstUtcStartDate": {
+      "_type": "DateTime",
+      "_value": "2026-06-01T13:00:00Z"
+    },
+    "lastUtcEndDate": {
+      "_type": "DateTime",
+      "_value": "2026-06-03T20:00:00Z"
+    }
+  }
+]

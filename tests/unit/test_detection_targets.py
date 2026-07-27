@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any, cast
 
 import pytest
 
@@ -15,10 +16,11 @@ from estate_sale_finder.domain.models import APPROVED_TARGET_CATEGORIES, CAMERA_
 
 
 def test_prompt_schema_allows_only_approved_categories() -> None:
+    schema = cast(dict[str, Any], VISION_RESPONSE_SCHEMA)
     enum_values = set(
-        VISION_RESPONSE_SCHEMA["properties"]["results"]["items"]["properties"]["items"]["items"][
-            "properties"
-        ]["category"]["enum"]
+        schema["properties"]["results"]["items"]["properties"]["items"]["items"]["properties"][
+            "category"
+        ]["enum"]
     )
 
     assert enum_values == APPROVED_TARGET_CATEGORIES
@@ -108,7 +110,7 @@ def test_perfume_and_jewelry_categories_are_accepted() -> None:
 
 def test_prompt_includes_only_configured_categories() -> None:
     prompt = build_system_prompt(frozenset({"jewelry"}))
-    schema = build_response_schema(frozenset({"jewelry"}))
+    schema = cast(dict[str, Any], build_response_schema(frozenset({"jewelry"})))
 
     assert "jewelry:" in prompt
     assert "golf_bag:" not in prompt

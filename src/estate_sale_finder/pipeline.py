@@ -4,7 +4,6 @@ import logging
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from datetime import timedelta
 from pathlib import Path
 
 from sqlalchemy import select
@@ -24,7 +23,12 @@ from estate_sale_finder.domain.models import ImageAnalysisResult, RunSummary, Sa
 from estate_sale_finder.images.downloader import ImageDownloader
 from estate_sale_finder.notifications.base import NotificationProvider
 from estate_sale_finder.sources.base import GalleryUnavailableError, SaleSource
-from estate_sale_finder.utils.dates import overlaps_window, utc_now
+from estate_sale_finder.utils.dates import (
+    DateTimeWindow,
+    overlaps_window,
+    sale_search_window,
+    utc_now,
+)
 from estate_sale_finder.utils.geo import haversine_miles
 from estate_sale_finder.watchlists import WatchlistProfile, load_watchlists
 
@@ -99,19 +103,42 @@ class Pipeline:
                 location = self.source.resolve_postal_code(self.settings.postal_code)
                 candidates = self.source.discover_sales(location)
                 summary.sales_discovered = len(candidates)
+                window = sale_search_window(
+                    utc_now(),
+                    mode=self.settings.sale_window_mode,
+                    timezone_name=self.settings.sale_timezone,
+                    lookahead_days=self.settings.lookahead_days,
+                )
                 eligible_candidates = self._filter_candidates(
-                    candidates, location.latitude, location.longitude
+                    candidates,
+                    location.latitude,
+                    location.longitude,
+                    window,
                 )
                 candidates_by_id = {
                     candidate.external_id: candidate for candidate in eligible_candidates
                 }
                 sales = self.source.hydrate_sales(list(candidates_by_id))
             summary.sales_hydrated = len(sales)
-            sales_to_refresh = self._persist_sales(sales, candidates_by_id, summary)
+            if not options.sale_id:
+                sales = self._filter_hydrated_sales(
+                    sales,
+                    set(candidates_by_id),
+                    window,
+                )
+            sales_to_refresh, selected_sale_ids = self._persist_sales(
+                sales, candidates_by_id, summary
+            )
             self._refresh_galleries(sales_to_refresh, summary)
-            self._download_discovered_images(summary)
-            self._analyze_images(options, summary)
-            self._send_digest(summary, options, run.id)
+            self._download_discovered_images(selected_sale_ids, summary)
+            analysis_sale_ids: set[int] | None = selected_sale_ids
+            if not options.sale_id and (options.reanalyze or options.reanalyze_version_mismatch):
+                analysis_sale_ids = None
+            self._analyze_images(options, summary, analysis_sale_ids)
+            notification_sale_ids: set[int] | None = selected_sale_ids
+            if options.reanalyze and not options.sale_id:
+                notification_sale_ids = None
+            self._send_digest(summary, options, run.id, notification_sale_ids)
             self.repo.finish_run(run, status="success", summary=summary)
             self.session.commit()
             logger.info("run_complete", extra=summary.__dict__)
@@ -137,9 +164,8 @@ class Pipeline:
         candidates: list[SaleCandidate],
         origin_lat: float,
         origin_lon: float,
+        window: DateTimeWindow,
     ) -> list[SaleCandidate]:
-        now = utc_now()
-        window_end = now + timedelta(days=self.settings.lookahead_days)
         eligible: list[SaleCandidate] = []
         for candidate in candidates:
             distance = haversine_miles(
@@ -150,7 +176,10 @@ class Pipeline:
             if candidate.sale_type not in self.settings.allowed_sale_types:
                 continue
             if not overlaps_window(
-                candidate.first_start_at, candidate.last_end_at, now, window_end
+                candidate.first_start_at,
+                candidate.last_end_at,
+                window.start_at,
+                window.end_at,
             ):
                 continue
             eligible.append(
@@ -158,13 +187,42 @@ class Pipeline:
             )
         return eligible
 
+    def _filter_hydrated_sales(
+        self,
+        sales: list[Sale],
+        expected_external_ids: set[str],
+        window: DateTimeWindow,
+    ) -> list[Sale]:
+        eligible: list[Sale] = []
+        for sale in sales:
+            if sale.external_id not in expected_external_ids:
+                logger.warning(
+                    "hydrated_sale_not_requested",
+                    extra={"sale_external_id": sale.external_id},
+                )
+                continue
+            if not overlaps_window(
+                sale.first_start_at,
+                sale.last_end_at,
+                window.start_at,
+                window.end_at,
+            ):
+                logger.warning(
+                    "hydrated_sale_outside_window",
+                    extra={"sale_external_id": sale.external_id},
+                )
+                continue
+            eligible.append(sale)
+        return eligible
+
     def _persist_sales(
         self,
         sales: list[Sale],
         candidates_by_id: dict[str, SaleCandidate],
         summary: RunSummary,
-    ) -> list[tuple[SaleORM, Sale]]:
+    ) -> tuple[list[tuple[SaleORM, Sale]], set[int]]:
         to_refresh: list[tuple[SaleORM, Sale]] = []
+        selected_sale_ids: set[int] = set()
         for sale in sales:
             candidate = candidates_by_id.get(sale.external_id)
             sale_with_distance = sale.__class__(
@@ -176,6 +234,7 @@ class Pipeline:
                 }
             )
             sale_orm, is_new, changed = self.repo.upsert_sale(sale_with_distance)
+            selected_sale_ids.add(sale_orm.id)
             if is_new:
                 summary.new_sales += 1
             if changed:
@@ -190,7 +249,7 @@ class Pipeline:
                 ):
                     to_refresh.append((sale_orm, sale_with_distance))
         self.session.commit()
-        return to_refresh
+        return to_refresh, selected_sale_ids
 
     def _refresh_galleries(self, sales: list[tuple[SaleORM, Sale]], summary: RunSummary) -> None:
         for sale_orm, sale in sales:
@@ -212,12 +271,19 @@ class Pipeline:
                 )
             self.session.commit()
 
-    def _download_discovered_images(self, summary: RunSummary) -> None:
+    def _download_discovered_images(
+        self,
+        sale_db_ids: set[int],
+        summary: RunSummary,
+    ) -> None:
+        if not sale_db_ids:
+            return
         images = list(
             self.session.scalars(
                 select(ImageORM).where(
+                    ImageORM.sale_id.in_(sale_db_ids),
                     (ImageORM.status == "discovered")
-                    | ((ImageORM.status == "error") & (ImageORM.downloaded_at.is_(None)))
+                    | ((ImageORM.status == "error") & (ImageORM.downloaded_at.is_(None))),
                 )
             )
         )
@@ -227,16 +293,17 @@ class Pipeline:
                 summary.images_downloaded += 1
             self.session.commit()
 
-    def _analyze_images(self, options: RunOptions, summary: RunSummary) -> None:
-        sale_db_id = None
-        if options.sale_id:
-            sale = self.repo.get_sale(self.source.source_name, options.sale_id)
-            sale_db_id = sale.id if sale else None
+    def _analyze_images(
+        self,
+        options: RunOptions,
+        summary: RunSummary,
+        sale_db_ids: set[int] | None,
+    ) -> None:
         images = self.repo.images_to_analyze(
             analysis_version=self.settings.analysis_version,
             reanalyze=options.reanalyze,
             version_mismatch=options.reanalyze_version_mismatch,
-            sale_db_id=sale_db_id,
+            sale_db_ids=sale_db_ids,
             active_only=options.active_only,
         )
         if self.settings.vision_max_images_per_run is not None:
@@ -481,7 +548,13 @@ class Pipeline:
             "sale_ids": sale_ids,
         }
 
-    def _send_digest(self, summary: RunSummary, options: RunOptions, run_id: int) -> None:
+    def _send_digest(
+        self,
+        summary: RunSummary,
+        options: RunOptions,
+        run_id: int,
+        sale_db_ids: set[int] | None,
+    ) -> None:
         if options.dry_run:
             summary.email_status = "dry_run"
             return
@@ -498,6 +571,7 @@ class Pipeline:
                     profile,
                     recipient,
                     limit=50,
+                    sale_db_ids=sale_db_ids,
                 )
                 if not detections and not profile.send_on_no_matches:
                     continue

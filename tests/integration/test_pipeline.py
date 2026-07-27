@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from PIL import Image
@@ -16,6 +17,7 @@ from estate_sale_finder.db.models import (
     DetectionORM,
     ImageORM,
     RunORM,
+    SaleORM,
 )
 from estate_sale_finder.domain.models import (
     DetectedItem,
@@ -26,6 +28,7 @@ from estate_sale_finder.domain.models import (
     SalePicture,
 )
 from estate_sale_finder.pipeline import Pipeline, RunOptions
+from estate_sale_finder.utils.dates import sale_search_window, utc_now
 from estate_sale_finder.watchlists import WatchlistProfile
 
 
@@ -33,10 +36,17 @@ class FakeSource:
     source_name = "fake"
 
     def __init__(self, picture_count: int = 5, picture_urls: list[str] | None = None):
+        window = sale_search_window(
+            utc_now(),
+            mode="upcoming_weekend",
+            timezone_name="America/New_York",
+            lookahead_days=15,
+        )
         self.picture_count = picture_count
         self.picture_urls = picture_urls or ["https://example.test/match-1.jpg"]
-        self.remote_modified_at = datetime(2026, 6, 20, tzinfo=UTC)
-        self.last_end_at = datetime(2026, 7, 2, tzinfo=UTC)
+        self.first_start_at = window.start_at + timedelta(hours=9)
+        self.remote_modified_at = utc_now() - timedelta(days=1)
+        self.last_end_at = window.end_at - timedelta(hours=8)
         self.gallery_calls = 0
 
     def resolve_postal_code(self, postal_code: str) -> PostalCodeLocation:
@@ -53,7 +63,7 @@ class FakeSource:
                 state="NY",
                 postal_code="14221",
                 sale_type="EstateSales",
-                first_start_at=datetime(2026, 7, 1, tzinfo=UTC),
+                first_start_at=self.first_start_at,
                 last_end_at=self.last_end_at,
             )
         ]
@@ -74,7 +84,7 @@ class FakeSource:
                 postal_code="14221",
                 sale_type="EstateSales",
                 picture_count=self.picture_count,
-                first_start_at=datetime(2026, 7, 1, tzinfo=UTC),
+                first_start_at=self.first_start_at,
                 last_end_at=self.last_end_at,
                 first_published_at=None,
                 remote_modified_at=self.remote_modified_at,
@@ -355,6 +365,117 @@ def test_first_run_then_idempotent_second_run(tmp_path: Path) -> None:
     assert second.images_analyzed == 0
     assert vision.calls == 1
     assert notifier.sent == 1
+
+
+def test_normal_run_does_not_process_or_email_ended_sale_backlog(tmp_path: Path) -> None:
+    session = _session()
+    repo_settings = _settings(tmp_path)
+    source = FakeSource()
+    notifier = FakeNotifier()
+    pipeline = Pipeline(
+        settings=repo_settings,
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=FakeVision(),
+        notifier=notifier,
+    )
+
+    ended_sale = SaleORM(
+        source="fake",
+        external_id="ended",
+        title="Ended sale",
+        url="https://example.test/sale/ended",
+        latitude=43.01,
+        longitude=-78.0,
+        type="EstateSales",
+        picture_count=5,
+        first_start_at=utc_now() - timedelta(days=10),
+        last_end_at=utc_now() - timedelta(days=7),
+        first_seen_at=utc_now() - timedelta(days=20),
+        last_seen_at=utc_now() - timedelta(days=7),
+        active=False,
+        gallery_status="ok",
+    )
+    session.add(ended_sale)
+    session.flush()
+    stale_image = ImageORM(
+        sale_id=ended_sale.id,
+        source_url="https://example.test/old-pending.jpg",
+        normalized_url="https://example.test/old-pending.jpg",
+        first_seen_at=utc_now() - timedelta(days=10),
+        status="discovered",
+    )
+    analyzed_old_image = ImageORM(
+        sale_id=ended_sale.id,
+        source_url="https://example.test/old-match.jpg",
+        normalized_url="https://example.test/old-match.jpg",
+        first_seen_at=utc_now() - timedelta(days=10),
+        analyzed_at=utc_now() - timedelta(days=9),
+        analysis_version="v1",
+        status="analyzed",
+    )
+    session.add_all([stale_image, analyzed_old_image])
+    session.flush()
+    old_detection = DetectionORM(
+        image_id=analyzed_old_image.id,
+        category="modern_camera",
+        label="old camera",
+        confidence=0.9,
+        modern_likelihood=0.8,
+        visible_brand=None,
+        notes=None,
+        model_provider="fake",
+        model_name="fake-model",
+        prompt_version="test",
+        analysis_version="v1",
+        created_at=utc_now() - timedelta(days=9),
+        included_in_email=False,
+    )
+    session.add(old_detection)
+    session.commit()
+
+    summary = pipeline.run(RunOptions())
+
+    session.refresh(stale_image)
+    assert stale_image.status == "discovered"
+    assert summary.images_downloaded == 1
+    assert summary.images_analyzed == 1
+    assert notifier.sent == 1
+    notifications = list(session.scalars(select(DetectionNotificationORM)))
+    assert len(notifications) == 1
+    assert notifications[0].detection_id != old_detection.id
+
+
+def test_hydrated_sale_must_still_overlap_weekend_window(tmp_path: Path) -> None:
+    class StaleHydrationSource(FakeSource):
+        def hydrate_sales(self, sale_ids: list[str]) -> list[Sale]:
+            return [
+                replace(
+                    sale,
+                    first_start_at=utc_now() - timedelta(days=10),
+                    last_end_at=utc_now() - timedelta(days=7),
+                )
+                for sale in super().hydrate_sales(sale_ids)
+            ]
+
+    session = _session()
+    source = StaleHydrationSource()
+    pipeline = Pipeline(
+        settings=_settings(tmp_path, email=False),
+        session=session,
+        source=source,
+        downloader=FakeDownloader(tmp_path),  # type: ignore[arg-type]
+        vision_provider=FakeVision(),
+    )
+
+    summary = pipeline.run(RunOptions())
+
+    assert summary.sales_hydrated == 1
+    assert summary.new_sales == 0
+    assert summary.images_downloaded == 0
+    assert summary.images_analyzed == 0
+    assert session.scalar(select(SaleORM)) is None
 
 
 def test_newly_added_image_only_is_analyzed(tmp_path: Path) -> None:

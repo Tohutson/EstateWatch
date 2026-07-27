@@ -173,17 +173,19 @@ class Repository:
         analysis_version: str,
         reanalyze: bool,
         version_mismatch: bool,
-        sale_db_id: int | None = None,
+        sale_db_ids: set[int] | None = None,
         active_only: bool = False,
     ) -> list[ImageORM]:
+        if sale_db_ids is not None and not sale_db_ids:
+            return []
         if reanalyze or version_mismatch:
             stmt: Select[tuple[ImageORM]] = select(ImageORM).where(
                 ImageORM.status.in_(["downloaded", "analyzed", "failed"])
             )
         else:
             stmt = select(ImageORM).where(ImageORM.status.in_(["downloaded", "failed"]))
-        if sale_db_id is not None:
-            stmt = stmt.where(ImageORM.sale_id == sale_db_id)
+        if sale_db_ids is not None:
+            stmt = stmt.where(ImageORM.sale_id.in_(sale_db_ids))
         if active_only:
             stmt = stmt.join(ImageORM.sale).where(SaleORM.last_end_at >= utc_now())
         if not reanalyze:
@@ -286,24 +288,26 @@ class Repository:
         recipient: str,
         *,
         limit: int,
+        sale_db_ids: set[int] | None = None,
     ) -> list[DetectionORM]:
-        return list(
-            self.session.scalars(
-                select(DetectionORM)
-                .options(selectinload(DetectionORM.image).selectinload(ImageORM.sale))
-                .where(DetectionORM.category.in_(profile.targets))
-                .where(DetectionORM.category.in_(APPROVED_TARGET_CATEGORIES))
-                .where(
-                    ~exists().where(
-                        (DetectionNotificationORM.detection_id == DetectionORM.id)
-                        & (DetectionNotificationORM.watchlist_id == profile.id)
-                        & (DetectionNotificationORM.recipient_email == recipient)
-                    )
+        if sale_db_ids is not None and not sale_db_ids:
+            return []
+        stmt = (
+            select(DetectionORM)
+            .options(selectinload(DetectionORM.image).selectinload(ImageORM.sale))
+            .where(DetectionORM.category.in_(profile.targets))
+            .where(DetectionORM.category.in_(APPROVED_TARGET_CATEGORIES))
+            .where(
+                ~exists().where(
+                    (DetectionNotificationORM.detection_id == DetectionORM.id)
+                    & (DetectionNotificationORM.watchlist_id == profile.id)
+                    & (DetectionNotificationORM.recipient_email == recipient)
                 )
-                .order_by(DetectionORM.created_at.asc())
-                .limit(limit)
             )
         )
+        if sale_db_ids is not None:
+            stmt = stmt.join(DetectionORM.image).where(ImageORM.sale_id.in_(sale_db_ids))
+        return list(self.session.scalars(stmt.order_by(DetectionORM.created_at.asc()).limit(limit)))
 
     def mark_notifications_sent(
         self,
