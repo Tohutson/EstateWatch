@@ -1,23 +1,26 @@
 # Agent Guidance
 
-- Inspect the existing architecture before changing code.
+- Inspect the existing architecture before you change code.
 - Keep the system single-process and simple. Do not add Redis, Celery, queues, Kubernetes, or services.
-- Preserve idempotency: reruns must not duplicate image analysis or email notifications.
+- Preserve idempotency. A rerun must not duplicate image analysis or email notifications.
 - Never weaken image-reference validation or map multi-image vision outputs by position.
-- Add mapping fixtures and retry tests when changing vision providers or provider parsing.
-- Isolate provider failures to the smallest safe image unit; one malformed response must not abort the full run.
+- If you change a vision provider or its parser, add mapping fixtures and retry tests.
+- Isolate provider failures to the smallest safe image unit. One malformed response must not abort the full run.
 - Keep EstateSales.NET behavior isolated in `src/estate_sale_finder/sources/estatesales_net.py`.
-- Add fixture-based parser tests whenever sale-page or API parsing changes.
-- Current approved targets are centralized in `TargetCategory`: golf clubs, golf bags, golf balls, modern digital cameras, modern camera lenses, collectible perfume bottles, and jewelry.
-- Do not hardcode recipient-specific logic; use watchlist configuration and routing.
-- Do not reintroduce a single global email-sent flag; notification idempotency is per detection, watchlist, and recipient.
+- If you change sale-page or API parsing, add fixture-based parser tests.
+- `TargetCategory` contains all approved targets.
+- Golf clubs, golf bags, and golf balls are approved targets.
+- Modern digital cameras, modern camera lenses, collectible perfume bottles, and jewelry are approved targets.
+- Do not hardcode recipient-specific logic. Use watchlist configuration and routing.
+- Do not add one global email-sent flag. Keep idempotency for each detection, watchlist, and recipient.
 - Do not add categories outside the central allowlist.
-- Do not duplicate image analysis per watchlist unless deliberately justified and versioned.
-- Keep watchlist routing tested.
+- Add versioned image analysis for a watchlist only when the design requires it.
+- Keep tests for watchlist routing.
 - Never commit secrets, `.env`, database files, thumbnails, model caches, or live credentials.
-- Run formatting, Ruff, mypy, tests, CLI help, and migrations before handing work back.
+- Before you hand work back, run formatting, Ruff, mypy, tests, CLI help, and migrations.
 - Update Alembic migrations when the schema changes.
 - Update the README for operational changes.
-- Commit work in focused, descriptive commits when commits are requested.
-- Avoid TODOs unless blocked by an external dependency; document the blocker and runtime behavior.
-- Document assumptions, especially around undocumented EstateSales.NET endpoints.
+- Write user documentation in ASD-STE100 Simplified Technical English.
+- When the user requests commits, make focused commits with clear descriptions.
+- Add a TODO only when an external dependency blocks the work. Document the blocker and runtime behavior.
+- Document assumptions about undocumented EstateSales.NET endpoints.
